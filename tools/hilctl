@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""Safety-gated HIL runner for Claude Code.
+
+All hardware-affecting commands are argv arrays from .hil/config.json and are
+executed without a shell. The wrapper fails closed when configuration,
+approval, identity, or safety bounds are missing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HIL = ROOT / ".hil"
+CONFIG_PATH = HIL / "config.json"
+POLICY_PATH = HIL / "safety-policy.json"
+APPROVAL_PATH = HIL / "approval.json"
+RUNTIME_PATH = HIL / "runtime.json"
+LOG_DIR = HIL / "logs"
+
+
+class HilError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HilError(f"Missing required file: {path.relative_to(ROOT)}") from exc
+    except json.JSONDecodeError as exc:
+        raise HilError(f"Invalid JSON in {path.relative_to(ROOT)}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HilError(f"Expected JSON object in {path.relative_to(ROOT)}")
+    return value
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def runtime_default() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "campaign_active": False,
+        "milestone": 0,
+        "trial_count": 0,
+        "same_failure_count": 0,
+        "last_failure_signature": None,
+        "stop_reason": None,
+        "updated_at": utc_now(),
+    }
+
+
+def load_runtime() -> dict[str, Any]:
+    if not RUNTIME_PATH.exists():
+        return runtime_default()
+    return load_json(RUNTIME_PATH)
+
+
+def save_runtime(runtime: dict[str, Any]) -> None:
+    runtime["updated_at"] = utc_now()
+    atomic_write(RUNTIME_PATH, runtime)
+
+
+def append_event(event: str, **fields: Any) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    record = {"timestamp": utc_now(), "event": event, **fields}
+    with (LOG_DIR / "events.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_arm_elf(path: Path, flash_start: int, flash_end: int) -> bool:
+    try:
+        header = path.read_bytes()[:52]
+    except OSError:
+        return False
+    if len(header) < 52 or header[:4] != b"\x7fELF":
+        return False
+    byte_order = "little" if header[5] == 1 else "big" if header[5] == 2 else None
+    if byte_order is None:
+        return False
+    if int.from_bytes(header[18:20], byte_order) != 40:
+        return False
+    entry = int.from_bytes(header[24:28], byte_order) & ~1
+    return flash_start <= entry < flash_end
+
+
+def last_json_object(stdout: str) -> dict[str, Any] | None:
+    for line in reversed([line.strip() for line in stdout.splitlines() if line.strip()]):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def identity_matches(stdout: str, target: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+    identity = last_json_object(stdout)
+    ok = bool(
+        identity
+        and identity.get("connected") is True
+        and identity.get("mcu") == target.get("expected_mcu")
+        and identity.get("probe_serial") == target.get("expected_probe_serial")
+    )
+    return ok, identity
+
+
+def halted_matches(stdout: str, target: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+    state = last_json_object(stdout)
+    ok = bool(
+        state
+        and state.get("state") == "halted"
+        and state.get("probe_serial") == target.get("expected_probe_serial")
+    )
+    return ok, state
+
+
+def git_context() -> dict[str, Any]:
+    def git(*args: str) -> str | None:
+        result = subprocess.run(
+            ["git", *args], cwd=ROOT, text=True, capture_output=True, check=False
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    return {
+        "commit": git("rev-parse", "HEAD"),
+        "status": git("status", "--short"),
+        "diff_hash": hashlib.sha256((git("diff") or "").encode()).hexdigest(),
+    }
+
+
+def configured_command(config: dict[str, Any], name: str) -> list[str]:
+    value = config.get("commands", {}).get(name)
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise HilError(f"Command '{name}' is not configured as a non-empty argv array")
+    if any("CONFIGURE_ME" in item for item in value):
+        raise HilError(f"Command '{name}' still contains CONFIGURE_ME")
+    return value
+
+
+def command_safety_issues(name: str, argv: list[str]) -> list[str]:
+    issues: list[str] = []
+    executable = Path(argv[0]).name.lower()
+    if executable in {"sh", "bash", "zsh", "fish", "powershell", "pwsh", "cmd", "cmd.exe"}:
+        issues.append(f"Command '{name}' may not use a shell interpreter")
+    joined = " ".join(argv)
+    required_placeholders = {
+        "identify": ("{probe_serial}",),
+        "flash": ("{artifact}", "{probe_serial}"),
+        "verify_halted": ("{probe_serial}",),
+        "test": ("{duty}", "{duration_ms}", "{rpm_limit}"),
+    }
+    for placeholder in required_placeholders.get(name, ()):
+        if placeholder not in joined:
+            issues.append(f"Command '{name}' must bind {placeholder}")
+    if name == "flash" and re.search(r"\breset\s+(?:run|exit)\b", joined, re.IGNORECASE):
+        issues.append("Command 'flash' must not run after flash; leave the target halted")
+    return issues
+
+
+def substitute(argv: list[str], values: dict[str, Any]) -> list[str]:
+    rendered = []
+    for item in argv:
+        current = item
+        for key, value in values.items():
+            current = current.replace("{" + key + "}", str(value))
+        rendered.append(current)
+    return rendered
+
+
+def run_action(
+    config: dict[str, Any],
+    name: str,
+    trial_dir: Path,
+    values: dict[str, Any],
+    timeout_s: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    argv = substitute(configured_command(config, name), values)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = (exc.stderr or "") + f"\n{name} timed out after {timeout_s}s"
+        result = subprocess.CompletedProcess(argv, 124, stdout, stderr)
+    duration_ms = round((time.monotonic() - started) * 1000)
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    (trial_dir / f"{name}.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (trial_dir / f"{name}.stderr.log").write_text(result.stderr, encoding="utf-8")
+    append_event(
+        name,
+        command=argv,
+        returncode=result.returncode,
+        duration_ms=duration_ms,
+        stdout_log=str((trial_dir / f"{name}.stdout.log").relative_to(ROOT)),
+        stderr_log=str((trial_dir / f"{name}.stderr.log").relative_to(ROOT)),
+    )
+    return result
+
+
+def doctor_report() -> dict[str, Any]:
+    issues: list[str] = []
+    details: dict[str, Any] = {}
+    try:
+        config = load_json(CONFIG_PATH)
+        policy = load_json(POLICY_PATH)
+        approval = load_json(APPROVAL_PATH)
+    except HilError as exc:
+        return {"ok": False, "issues": [str(exc)], "details": details}
+
+    if config.get("schema_version") != 1:
+        issues.append("config.json schema_version must be 1")
+    if policy.get("schema_version") != 1:
+        issues.append("safety-policy.json schema_version must be 1")
+    if approval.get("schema_version") != 1:
+        issues.append("approval.json schema_version must be 1")
+
+    target = config.get("target", {})
+    for field in ("expected_mcu", "expected_probe_serial", "firmware_artifact"):
+        value = target.get(field)
+        if not isinstance(value, str) or not value or "CONFIGURE_ME" in value:
+            issues.append(f"target.{field} is not configured")
+    if target.get("flash_leaves_target_halted") is not True:
+        issues.append("target.flash_leaves_target_halted must be true")
+    if target.get("firmware_starts_disarmed") is not True:
+        issues.append("target.firmware_starts_disarmed must be true")
+    flash_start = target.get("flash_start")
+    flash_end = target.get("flash_end")
+    if not isinstance(flash_start, int) or not isinstance(flash_end, int) or flash_start >= flash_end:
+        issues.append("target.flash_start and target.flash_end must define a valid integer range")
+
+    for name in ("build", "identify", "flash", "verify_halted", "stop", "test"):
+        try:
+            argv = configured_command(config, name)
+            issues.extend(command_safety_issues(name, argv))
+        except HilError as exc:
+            issues.append(str(exc))
+    capture = config.get("commands", {}).get("capture")
+    if capture:
+        try:
+            argv = configured_command(config, "capture")
+            issues.extend(command_safety_issues("capture", argv))
+        except HilError as exc:
+            issues.append(str(exc))
+
+    numeric_fields = (
+        "max_duty_percent",
+        "max_duration_ms",
+        "max_rpm",
+        "max_trials_per_campaign",
+        "same_failure_limit",
+    )
+    for field in numeric_fields:
+        value = policy.get(field)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+            issues.append(f"safety-policy.json {field} must be greater than zero")
+
+    details["target"] = target
+    details["approval"] = {
+        "approved_milestone": approval.get("approved_milestone"),
+        "hardware_armed": approval.get("hardware_armed"),
+        "fault_latched": approval.get("fault_latched"),
+    }
+    return {"ok": not issues, "issues": issues, "details": details}
+
+
+def ensure_doctor_ok() -> None:
+    report = doctor_report()
+    if not report["ok"]:
+        raise HilError("Doctor failed: " + "; ".join(report["issues"]))
+
+
+def ensure_campaign(milestone: int | None = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    config = load_json(CONFIG_PATH)
+    policy = load_json(POLICY_PATH)
+    approval = load_json(APPROVAL_PATH)
+    runtime = load_runtime()
+    expected = milestone if milestone is not None else int(runtime.get("milestone", 0))
+    if approval.get("approved_milestone") != expected:
+        raise HilError(f"Milestone {expected} is not approved")
+    if approval.get("hardware_armed") is not True:
+        raise HilError("Hardware is not armed by the user")
+    if approval.get("fault_latched") is True:
+        raise HilError(f"Fault is latched: {approval.get('fault_reason')}")
+    if approval.get("config_sha256") != sha256_file(CONFIG_PATH):
+        raise HilError("HIL config changed after approval; user re-approval is required")
+    if approval.get("policy_sha256") != sha256_file(POLICY_PATH):
+        raise HilError("Safety policy changed after approval; user re-approval is required")
+    return config, policy, approval, runtime
+
+
+def stop_and_latch(
+    reason: str,
+    approval: dict[str, Any],
+    runtime: dict[str, Any],
+    fault: bool,
+) -> None:
+    runtime["campaign_active"] = False
+    runtime["stop_reason"] = reason
+    approval["hardware_armed"] = False
+    if fault:
+        approval["fault_latched"] = True
+        approval["fault_reason"] = reason
+    atomic_write(APPROVAL_PATH, approval)
+    save_runtime(runtime)
+    append_event("campaign_stopped", reason=reason, fault=fault)
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    report = doctor_report()
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print("OK" if report["ok"] else "NOT READY")
+        for issue in report["issues"]:
+            print(f"- {issue}")
+    return 0 if report["ok"] else 2
+
+
+def command_status(_: argparse.Namespace) -> int:
+    value = {
+        "doctor": doctor_report(),
+        "approval": load_json(APPROVAL_PATH) if APPROVAL_PATH.exists() else None,
+        "runtime": load_runtime(),
+    }
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0
+
+
+def command_identify(args: argparse.Namespace) -> int:
+    config = load_json(CONFIG_PATH)
+    target = config.get("target", {})
+    for field in ("expected_mcu", "expected_probe_serial", "identity_pattern"):
+        value = target.get(field)
+        if not isinstance(value, str) or not value or "CONFIGURE_ME" in value:
+            raise HilError(f"target.{field} is not configured")
+    argv = configured_command(config, "identify")
+    issues = command_safety_issues("identify", argv)
+    if issues:
+        raise HilError("; ".join(issues))
+    identify_dir = LOG_DIR / ("identify-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"))
+    values = {"probe_serial": target["expected_probe_serial"]}
+    result = run_action(config, "identify", identify_dir, values, timeout_s=args.timeout)
+    matched, identity = identity_matches(result.stdout, target)
+    ok = result.returncode == 0 and matched
+    report = {"ok": ok, "returncode": result.returncode, "identity": identity}
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print(result.stdout, end="")
+    return 0 if ok else 2
+
+
+def command_campaign(args: argparse.Namespace) -> int:
+    if args.campaign_action == "start":
+        ensure_doctor_ok()
+        config, policy, approval, runtime = ensure_campaign(args.milestone)
+        runtime["milestone"] = args.milestone
+        preflight_dir = LOG_DIR / (
+            "preflight-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        )
+        values = {"probe_serial": config["target"]["expected_probe_serial"]}
+        stopped = run_action(config, "stop", preflight_dir, values, timeout_s=3.0)
+        if stopped.returncode != 0:
+            stop_and_latch("stop preflight failed", approval, runtime, fault=True)
+            raise HilError("Stop preflight failed; hardware disarmed and fault latched")
+        identified = run_action(config, "identify", preflight_dir, values, timeout_s=10.0)
+        identity_ok, _ = identity_matches(identified.stdout, config["target"])
+        if identified.returncode != 0 or not identity_ok:
+            stop_and_latch("target identity preflight failed", approval, runtime, fault=True)
+            raise HilError("Target identity preflight failed; hardware disarmed and fault latched")
+        runtime.update(
+            {
+                "campaign_active": True,
+                "milestone": args.milestone,
+                "trial_count": 0,
+                "same_failure_count": 0,
+                "last_failure_signature": None,
+                "stop_reason": None,
+                "max_trials": int(policy["max_trials_per_campaign"]),
+            }
+        )
+        save_runtime(runtime)
+        append_event("campaign_started", milestone=args.milestone)
+        print(json.dumps({"status": "started", "milestone": args.milestone}))
+        return 0
+
+    approval = load_json(APPROVAL_PATH)
+    runtime = load_runtime()
+    config = load_json(CONFIG_PATH)
+    stop_dir = LOG_DIR / ("campaign-stop-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"))
+    values = {"probe_serial": config.get("target", {}).get("expected_probe_serial", "")}
+    stopped = run_action(config, "stop", stop_dir, values, timeout_s=3.0)
+    if stopped.returncode != 0:
+        stop_and_latch("campaign hardware stop failed", approval, runtime, fault=True)
+        raise HilError("Campaign hardware stop failed; fault latched")
+    if args.campaign_action == "complete":
+        stop_and_latch("milestone_complete", approval, runtime, fault=False)
+        print(json.dumps({"status": "complete", "milestone": runtime.get("milestone")}))
+        return 0
+    stop_and_latch(args.reason, approval, runtime, fault=args.fault)
+    print(json.dumps({"status": "stopped", "reason": args.reason, "fault": args.fault}))
+    return 0
+
+
+def parse_test_status(stdout: str, returncode: int, safe_codes: set[int]) -> tuple[str, str]:
+    for line in reversed([line.strip() for line in stdout.splitlines() if line.strip()]):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("status") in {"pass", "retryable", "fault"}:
+            return str(value["status"]), str(value.get("signature") or f"exit-{returncode}")
+    if returncode == 0:
+        return "pass", "ok"
+    if returncode in safe_codes:
+        return "retryable", f"exit-{returncode}"
+    return "fault", f"exit-{returncode}"
+
+
+def command_trial(args: argparse.Namespace) -> int:
+    ensure_doctor_ok()
+    config, policy, approval, runtime = ensure_campaign()
+    if runtime.get("campaign_active") is not True:
+        raise HilError("No active HIL campaign")
+
+    bounds = {
+        "duty": (args.duty, float(policy["max_duty_percent"])),
+        "duration-ms": (args.duration_ms, int(policy["max_duration_ms"])),
+        "rpm-limit": (args.rpm_limit, int(policy["max_rpm"])),
+    }
+    for name, (actual, maximum) in bounds.items():
+        if not math.isfinite(float(actual)) or not math.isfinite(float(maximum)):
+            raise HilError(f"{name} and its safety maximum must be finite")
+        if actual < 0 or actual > maximum:
+            raise HilError(f"{name} {actual} exceeds safety maximum {maximum}")
+    if int(runtime.get("trial_count", 0)) >= int(policy["max_trials_per_campaign"]):
+        stop_and_latch("campaign trial limit reached", approval, runtime, fault=False)
+        raise HilError("Campaign trial limit reached")
+
+    trial_number = int(runtime.get("trial_count", 0)) + 1
+    trial_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{trial_number:03d}"
+    trial_dir = LOG_DIR / trial_id
+    artifact = ROOT / config["target"]["firmware_artifact"]
+    values = {
+        "artifact": artifact,
+        "duty": args.duty,
+        "duration_ms": args.duration_ms,
+        "rpm_limit": args.rpm_limit,
+        "trial_id": trial_id,
+        "probe_serial": config["target"]["expected_probe_serial"],
+    }
+    manifest = {
+        "trial_id": trial_id,
+        "timestamp": utc_now(),
+        "milestone": runtime["milestone"],
+        "label": args.label,
+        "parameters": {
+            "duty_percent": args.duty,
+            "duration_ms": args.duration_ms,
+            "rpm_limit": args.rpm_limit,
+        },
+        "git": git_context(),
+        "approval_id": approval.get("approval_id"),
+    }
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write(trial_dir / "manifest.json", manifest)
+    append_event("trial_started", trial_id=trial_id, milestone=runtime["milestone"], label=args.label)
+
+    test_status = "not-run"
+    signature = "not-run"
+    stop_failed = False
+    failure_reason: str | None = None
+    flashed = False
+    stopped_after_test = False
+    artifact_before = None
+    if artifact.exists():
+        artifact_before = (artifact.stat().st_mtime_ns, sha256_file(artifact))
+    try:
+        build = run_action(config, "build", trial_dir, values)
+        if build.returncode != 0:
+            failure_reason = f"build failed with exit {build.returncode}"
+            returncode = 20
+        elif not artifact.is_file():
+            failure_reason = f"firmware artifact missing after build: {artifact}"
+            returncode = 21
+        elif artifact_before is not None and artifact_before == (artifact.stat().st_mtime_ns, sha256_file(artifact)):
+            failure_reason = f"firmware artifact was not refreshed by this build: {artifact}"
+            returncode = 26
+        elif not is_arm_elf(artifact, int(config["target"]["flash_start"]), int(config["target"]["flash_end"])):
+            failure_reason = f"firmware artifact is not an ARM ELF: {artifact}"
+            returncode = 24
+        else:
+            manifest["artifact_sha256"] = sha256_file(artifact)
+            atomic_write(trial_dir / "manifest.json", manifest)
+            identify = run_action(config, "identify", trial_dir, values)
+            identity_ok, identity = identity_matches(identify.stdout, config["target"])
+            manifest["target_identity"] = identity
+            atomic_write(trial_dir / "manifest.json", manifest)
+            if identify.returncode != 0 or not identity_ok:
+                failure_reason = "target identity mismatch"
+                returncode = 22
+            else:
+                flash = run_action(config, "flash", trial_dir, values)
+                flashed = True
+                if flash.returncode != 0:
+                    failure_reason = f"flash failed with exit {flash.returncode}"
+                    returncode = 23
+                else:
+                    halted = run_action(config, "verify_halted", trial_dir, values, timeout_s=5.0)
+                    halted_ok, halted_state = halted_matches(halted.stdout, config["target"])
+                    manifest["post_flash_state"] = halted_state
+                    atomic_write(trial_dir / "manifest.json", manifest)
+                    if halted.returncode != 0 or not halted_ok:
+                        failure_reason = "target halted state not confirmed after flash"
+                        returncode = 25
+                    else:
+                        timeout_s = max(1.0, args.duration_ms / 1000.0 + 5.0)
+                        tested = run_action(config, "test", trial_dir, values, timeout_s=timeout_s)
+                        test_status, signature = parse_test_status(
+                            tested.stdout,
+                            tested.returncode,
+                            {int(code) for code in policy.get("safe_retry_exit_codes", [])},
+                        )
+                        returncode = tested.returncode
+                        if test_status == "fault":
+                            failure_reason = f"test fault: {signature}"
+                        elif test_status == "retryable":
+                            failure_reason = f"retryable test failure: {signature}"
+                        stopped = run_action(config, "stop", trial_dir, values, timeout_s=3.0)
+                        stopped_after_test = stopped.returncode == 0
+                        if not stopped_after_test:
+                            failure_reason = "stop after test failed"
+                            test_status = "fault"
+                            returncode = 27
+                        elif config.get("commands", {}).get("capture"):
+                            captured = run_action(config, "capture", trial_dir, values, timeout_s=5.0)
+                            if captured.returncode != 0:
+                                failure_reason = f"capture failed with exit {captured.returncode}"
+                                test_status = "fault"
+                                returncode = 28
+    finally:
+        try:
+            stopped = run_action(config, "stop", trial_dir, values, timeout_s=3.0)
+            stop_failed = stopped.returncode != 0
+        except Exception as exc:  # fail closed if the configured stop path itself breaks
+            stop_failed = True
+            append_event("stop_exception", trial_id=trial_id, error=str(exc))
+
+    runtime["trial_count"] = trial_number
+    if stop_failed:
+        stop_and_latch("emergency stop command failed", approval, runtime, fault=True)
+        raise HilError("Emergency stop command failed")
+    if failure_reason and test_status != "retryable":
+        manifest.update({"result": "fault", "signature": signature, "next_decision": "campaign_stopped", "reason": failure_reason})
+        atomic_write(trial_dir / "manifest.json", manifest)
+        stop_and_latch(failure_reason, approval, runtime, fault=flashed or test_status == "fault")
+        raise HilError(failure_reason)
+    if test_status == "retryable":
+        if runtime.get("last_failure_signature") == signature:
+            runtime["same_failure_count"] = int(runtime.get("same_failure_count", 0)) + 1
+        else:
+            runtime["last_failure_signature"] = signature
+            runtime["same_failure_count"] = 1
+        if runtime["same_failure_count"] >= int(policy["same_failure_limit"]):
+            stop_and_latch(f"same failure repeated: {signature}", approval, runtime, fault=False)
+        else:
+            save_runtime(runtime)
+        append_event("trial_complete", trial_id=trial_id, status="retryable", signature=signature)
+        manifest.update({"result": "retryable", "signature": signature, "next_decision": "analyze_one_new_hypothesis"})
+        atomic_write(trial_dir / "manifest.json", manifest)
+        print(json.dumps({"status": "retryable", "signature": signature, "trial_id": trial_id}))
+        return returncode or 10
+
+    runtime["same_failure_count"] = 0
+    runtime["last_failure_signature"] = None
+    save_runtime(runtime)
+    append_event("trial_complete", trial_id=trial_id, status="pass", signature=signature)
+    manifest.update({"result": "pass", "signature": signature, "next_decision": "analyze_evidence"})
+    atomic_write(trial_dir / "manifest.json", manifest)
+    print(json.dumps({"status": "pass", "signature": signature, "trial_id": trial_id}))
+    return 0
+
+
+def command_stop(args: argparse.Namespace) -> int:
+    config = load_json(CONFIG_PATH)
+    trial_dir = LOG_DIR / ("manual-stop-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    values = {"probe_serial": config.get("target", {}).get("expected_probe_serial", "")}
+    result = run_action(config, "stop", trial_dir, values, timeout_s=args.timeout)
+    if result.returncode != 0:
+        raise HilError(f"Stop command failed with exit {result.returncode}")
+    print(json.dumps({"status": "stopped"}))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Safety-gated STM32 BLDC HIL controller")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="Validate configuration without touching hardware")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(handler=command_doctor)
+
+    status = sub.add_parser("status", help="Show approval and campaign state")
+    status.set_defaults(handler=command_status)
+
+    identify = sub.add_parser("identify", help="Read and validate target/probe identity without arming")
+    identify.add_argument("--json", action="store_true")
+    identify.add_argument("--timeout", type=float, default=10.0)
+    identify.set_defaults(handler=command_identify)
+
+    campaign = sub.add_parser("campaign", help="Manage one approved milestone campaign")
+    campaign_sub = campaign.add_subparsers(dest="campaign_action", required=True)
+    start = campaign_sub.add_parser("start")
+    start.add_argument("--milestone", type=int, required=True)
+    start.set_defaults(handler=command_campaign)
+    complete = campaign_sub.add_parser("complete")
+    complete.set_defaults(handler=command_campaign)
+    stop = campaign_sub.add_parser("stop")
+    stop.add_argument("--reason", required=True)
+    stop.add_argument("--fault", action="store_true")
+    stop.set_defaults(handler=command_campaign)
+
+    trial = sub.add_parser("trial", help="Run one bounded build/flash/test/stop cycle")
+    trial.add_argument("--duty", type=float, required=True)
+    trial.add_argument("--duration-ms", type=int, required=True)
+    trial.add_argument("--rpm-limit", type=int, required=True)
+    trial.add_argument("--label", default="unnamed")
+    trial.set_defaults(handler=command_trial)
+
+    stop_now = sub.add_parser("stop", help="Run the configured stop command immediately")
+    stop_now.add_argument("--timeout", type=float, default=3.0)
+    stop_now.set_defaults(handler=command_stop)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        return int(args.handler(args))
+    except HilError as exc:
+        print(f"hilctl: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("hilctl: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Human-only approval and arming helper.
+
+Claude Code's PreToolUse hook blocks this command. Run it directly in a human
+terminal after reviewing the milestone and physical setup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+APPROVAL_PATH = ROOT / ".hil" / "approval.json"
+CONFIG_PATH = ROOT / ".hil" / "config.json"
+POLICY_PATH = ROOT / ".hil" / "safety-policy.json"
+RUNTIME_PATH = ROOT / ".hil" / "runtime.json"
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def load_approval() -> dict[str, Any]:
+    if not APPROVAL_PATH.exists():
+        return {
+            "schema_version": 1,
+            "approved_milestone": 0,
+            "hardware_armed": False,
+            "fault_latched": False,
+            "fault_reason": None,
+            "approval_id": None,
+            "config_sha256": None,
+            "policy_sha256": None,
+        }
+    return json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
+
+
+def save(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bind_approval_snapshot(value: dict[str, Any]) -> bool:
+    if not CONFIG_PATH.exists() or not POLICY_PATH.exists():
+        print("Missing .hil/config.json or .hil/safety-policy.json", file=sys.stderr)
+        return False
+    value["config_sha256"] = sha256_file(CONFIG_PATH)
+    value["policy_sha256"] = sha256_file(POLICY_PATH)
+    return True
+
+
+def stop_runtime(reason: str) -> None:
+    if not RUNTIME_PATH.exists():
+        return
+    runtime = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
+    runtime.update(
+        {
+            "campaign_active": False,
+            "stop_reason": reason,
+            "updated_at": utc_now(),
+        }
+    )
+    save(RUNTIME_PATH, runtime)
+
+
+def confirm(args: argparse.Namespace, prompt: str) -> bool:
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Refusing non-interactive approval without --yes", file=sys.stderr)
+        return False
+    return input(prompt + " [type YES]: ").strip() == "YES"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Human approval tool for HIL milestones")
+    sub = parser.add_subparsers(dest="command", required=True)
+    approve = sub.add_parser("approve-milestone")
+    approve.add_argument("milestone", type=int)
+    approve.add_argument("--arm", action="store_true")
+    approve.add_argument("--yes", action="store_true")
+    disarm = sub.add_parser("disarm")
+    disarm.add_argument("--yes", action="store_true")
+    clear = sub.add_parser("clear-fault")
+    clear.add_argument("--arm", action="store_true")
+    clear.add_argument("--yes", action="store_true")
+    limits = sub.add_parser("set-limits")
+    limits.add_argument("--max-duty-percent", type=float)
+    limits.add_argument("--max-duration-ms", type=int)
+    limits.add_argument("--max-rpm", type=int)
+    limits.add_argument("--max-trials-per-campaign", type=int)
+    limits.add_argument("--same-failure-limit", type=int)
+    limits.add_argument("--yes", action="store_true")
+    sub.add_parser("show")
+    args = parser.parse_args()
+
+    value = load_approval()
+    if args.command == "show":
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8")) if POLICY_PATH.exists() else None
+        print(json.dumps({"approval": value, "safety_policy": policy}, indent=2, sort_keys=True))
+        return 0
+    if args.command == "set-limits":
+        if not POLICY_PATH.exists():
+            print("Missing .hil/safety-policy.json", file=sys.stderr)
+            return 2
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        updates = {
+            "max_duty_percent": args.max_duty_percent,
+            "max_duration_ms": args.max_duration_ms,
+            "max_rpm": args.max_rpm,
+            "max_trials_per_campaign": args.max_trials_per_campaign,
+            "same_failure_limit": args.same_failure_limit,
+        }
+        updates = {key: val for key, val in updates.items() if val is not None}
+        if not updates or any(
+            isinstance(item, bool)
+            or not math.isfinite(float(item))
+            or float(item) <= 0
+            for item in updates.values()
+        ):
+            print("Provide at least one positive safety limit", file=sys.stderr)
+            return 2
+        summary = ", ".join(f"{key}={val}" for key, val in updates.items())
+        if not confirm(args, f"Update protected HIL limits: {summary}?"):
+            return 2
+        policy.update(updates)
+        policy["updated_at"] = utc_now()
+        save(POLICY_PATH, policy)
+        value.update(
+            {
+                "hardware_armed": False,
+                "approval_id": None,
+                "policy_sha256": None,
+            }
+        )
+        save(APPROVAL_PATH, value)
+        stop_runtime("safety_policy_changed")
+        print(json.dumps({"approval": value, "safety_policy": policy}, indent=2, sort_keys=True))
+        return 0
+    if args.command == "approve-milestone":
+        if value.get("fault_latched") is True:
+            print("Fault is latched; run clear-fault before approving a milestone", file=sys.stderr)
+            return 2
+        if not bind_approval_snapshot(value):
+            return 2
+        prompt = f"Approve Milestone {args.milestone} and arm={args.arm}?"
+        if not confirm(args, prompt):
+            return 2
+        value.update(
+            {
+                "schema_version": 1,
+                "approved_milestone": args.milestone,
+                "hardware_armed": bool(args.arm),
+                "approval_id": str(uuid.uuid4()),
+                "approved_at": utc_now(),
+            }
+        )
+    elif args.command == "disarm":
+        if not confirm(args, "Disarm the HIL campaign?"):
+            return 2
+        value["hardware_armed"] = False
+        value["approval_id"] = None
+        stop_runtime("human_disarm")
+    elif args.command == "clear-fault":
+        if args.arm and not bind_approval_snapshot(value):
+            return 2
+        if not confirm(args, f"Clear latched fault and arm={args.arm}?"):
+            return 2
+        value.update(
+            {
+                "hardware_armed": bool(args.arm),
+                "fault_latched": False,
+                "fault_reason": None,
+                "approval_id": str(uuid.uuid4()),
+                "approved_at": utc_now(),
+            }
+        )
+    save(APPROVAL_PATH, value)
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
