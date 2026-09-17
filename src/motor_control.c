@@ -20,6 +20,9 @@ static uint32_t active_seq;
 static bool capture_pending;
 static uint32_t probe_step;
 static uint32_t probe_step_ms;
+static uint32_t ramp_us;
+static uint32_t ramp_accum_us;
+static uint32_t align_remaining_ms;
 
 static void probe_bridge_table(void)
 {
@@ -59,6 +62,9 @@ void motor_control_init(void)
     capture_pending = false;
     probe_step = 0u;
     probe_step_ms = 0u;
+    ramp_us = 0u;
+    ramp_accum_us = 0u;
+    align_remaining_ms = 0u;
 
     hil_state.state = MOTOR_STOP;
     hil_state.fault = FAULT_NONE;
@@ -72,7 +78,7 @@ void motor_control_init(void)
     adc_init();
 }
 
-#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE || MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
 /* Step 0 is the undriven baseline; steps 1..6 walk A-high, A-low, B-high,
  * B-low, C-high, C-low; step 7 returns to undriven. */
 static void probe_gate_for_step(uint32_t step, uint32_t *phase, uint32_t *high_side)
@@ -88,9 +94,16 @@ static void probe_gate_for_step(uint32_t step, uint32_t *phase, uint32_t *high_s
 
 static void apply_probe_step(uint32_t step)
 {
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
+    /* Sector 0 stays applied for the whole run; the steps only pace the
+     * sampling. Unlike the phase probe, this one does put current through the
+     * motor: A sources, B sinks, C floats. */
+    (void)step;
+#else
     uint32_t phase, high_side;
     probe_gate_for_step(step, &phase, &high_side);
     motor_hw_drive_single_gate(phase, high_side != 0u);
+#endif
 }
 
 static void record_probe_step(uint32_t step)
@@ -110,10 +123,22 @@ static void record_probe_step(uint32_t step)
     hil_probe.step[step].step = step;
     hil_probe.step[step].phase = phase;
     hil_probe.step[step].high_side = high_side;
-    hil_probe.step[step].phase_a = sample.phase_a;
-    hil_probe.step[step].phase_b = sample.phase_b;
-    hil_probe.step[step].phase_c = sample.phase_c;
-    hil_probe.step[step].vrefint = sample.vrefint;
+    hil_probe.step[step].phase_a = sample.phase_a.mean;
+    hil_probe.step[step].phase_b = sample.phase_b.mean;
+    hil_probe.step[step].phase_c = sample.phase_c.mean;
+    hil_probe.step[step].vrefint = sample.vrefint.mean;
+    hil_probe.step[step].phase_a_min = sample.phase_a.min;
+    hil_probe.step[step].phase_a_med = sample.phase_a.median;
+    hil_probe.step[step].phase_a_max = sample.phase_a.max;
+    hil_probe.step[step].phase_b_min = sample.phase_b.min;
+    hil_probe.step[step].phase_b_med = sample.phase_b.median;
+    hil_probe.step[step].phase_b_max = sample.phase_b.max;
+    hil_probe.step[step].phase_c_min = sample.phase_c.min;
+    hil_probe.step[step].phase_c_med = sample.phase_c.median;
+    hil_probe.step[step].phase_c_max = sample.phase_c.max;
+    hil_probe.step[step].vrefint_min = sample.vrefint.min;
+    hil_probe.step[step].vrefint_med = sample.vrefint.median;
+    hil_probe.step[step].vrefint_max = sample.vrefint.max;
     hil_probe.step[step].ccer = ccer;
 }
 
@@ -134,7 +159,9 @@ static void advance_probe(void)
     if (probe_step < HIL_PROBE_STEPS) {
         apply_probe_step(probe_step);
     } else {
+#if MOTOR_BRIDGE_MODE != MOTOR_MODE_SECTOR_HOLD
         motor_hw_drive_single_gate(3u, false); /* park undriven */
+#endif
         hil_probe.complete = 1u;
     }
 }
@@ -192,7 +219,19 @@ static void start_bridge(void)
 
 #if MOTOR_BRIDGE_MODE == MOTOR_MODE_COMPLEMENTARY_A
     motor_hw_set_complementary_a();
-#elif MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+#elif MOTOR_BRIDGE_MODE == MOTOR_MODE_FORCED_RAMP
+    sector = 0u;
+    commutation_apply(sector);
+    hil_state.sector = 0u;
+    hil_state.state = MOTOR_ALIGN;
+    align_remaining_ms = ALIGN_MS;
+    ramp_us = RAMP_START_US;
+    ramp_accum_us = 0u;
+#elif MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE || MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
+    commutation_apply(0u);
+    hil_state.sector = 0u;
+#endif
     hil_probe.count = HIL_PROBE_STEPS;
     hil_probe.complete = 0u;
     hil_probe.tail_magic = HIL_TAIL_MAGIC;
@@ -207,14 +246,67 @@ static void start_bridge(void)
 
     motor_hw_enable();
     hil_state.moe = 1u;
+#if MOTOR_BRIDGE_MODE != MOTOR_MODE_FORCED_RAMP
     hil_state.state = MOTOR_FORCED_START;
+#endif
 
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE || MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
+    /* These modes hold a static bridge state and measure it with the ADC. A
+     * gate capture would record 12 KiB of unchanging levels and then have to
+     * be dragged back over SWD, which is the largest and least reliable
+     * transfer in a trial -- and it already cost one. */
+    capture_pending = false;
+#else
     /* Arm the capture on the *next* tick, not this one. CCRx and CCMRx are
      * preloaded, so they only take effect on the following update event --
      * capturing immediately would put up to one PWM period of transition
      * (31 us, 13 % of the 241 us window) into the measurement. */
     capture_pending = true;
+#endif
 }
+
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_FORCED_RAMP
+static void advance_forced_ramp(void)
+{
+    if (align_remaining_ms) {
+        align_remaining_ms--;
+        if (align_remaining_ms == 0u) {
+            hil_state.state = MOTOR_FORCED_START;
+        }
+        return;
+    }
+
+    /* One millisecond of sector time per tick, spent in whole sectors. The
+     * period shrinks linearly with elapsed run time, so the schedule is a
+     * function of the clock and not of anything the rotor does -- that is what
+     * makes it open loop. */
+    ramp_accum_us += 1000u;
+    while (ramp_us && ramp_accum_us >= ramp_us) {
+        ramp_accum_us -= ramp_us;
+        sector = (sector + 1u) % SECTOR_COUNT;
+        commutation_apply(sector);
+        hil_state.sector = sector;
+        hil_state.commutations++;
+
+        if (run_limit_ms > ALIGN_MS) {
+            const uint32_t span = run_limit_ms - ALIGN_MS;
+            const uint32_t done = (run_ms > ALIGN_MS) ? (run_ms - ALIGN_MS) : 0u;
+            const uint32_t drop = RAMP_START_US - RAMP_END_US;
+            ramp_us = RAMP_START_US - (drop * (done < span ? done : span)) / span;
+        }
+        /* The commanded mechanical speed, not a measured one: nothing here
+         * knows whether the rotor is following. It is still checked against
+         * the host's ceiling, because a schedule that commands more than the
+         * campaign allows is out of bounds whether or not the rotor obeys. */
+        hil_state.rpm_est = 60000000u / (ramp_us * SECTOR_COUNT * MOTOR_POLE_PAIRS);
+        hil_state.t60_raw_ticks = ramp_us;
+        if (hil_cmd.rpm_limit && hil_state.rpm_est > hil_cmd.rpm_limit) {
+            stop_bridge(FAULT_RPM_LIMIT);
+            return;
+        }
+    }
+}
+#endif
 
 static void advance_sector(void)
 {
@@ -263,8 +355,10 @@ void motor_control_tick_1khz(void)
     run_ms++;
     hil_state.run_ms = run_ms;
     advance_sector();
-#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE || MOTOR_BRIDGE_MODE == MOTOR_MODE_SECTOR_HOLD
     advance_probe();
+#elif MOTOR_BRIDGE_MODE == MOTOR_MODE_FORCED_RAMP
+    advance_forced_ramp();
 #endif
     if (capture_pending) {
         capture_pending = false;

@@ -40,7 +40,7 @@ target_include_directories(ecia_bldc PRIVATE
 
 target_compile_definitions(ecia_bldc PRIVATE
     STM32G431xx
-    MOTOR_BRIDGE_MODE=4
+    MOTOR_BRIDGE_MODE=5
     BUILD_ID=0x${GIT_SHA}u)
 
 target_compile_options(ecia_bldc PRIVATE

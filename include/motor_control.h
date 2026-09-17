@@ -37,6 +37,13 @@
  *                      proves the power stage follows the gates before any
  *                      commutation puts current through the motor. */
 #define MOTOR_MODE_PHASE_PROBE     4
+/*   5 FORCED_RAMP      Milestone 2 proper: align the rotor, then commutate on
+ *                      a schedule that speeds up, with BEMF playing no part.
+ *                      Whether the rotor follows is not something the firmware
+ *                      can tell -- that is what Milestone 3's comparators are
+ *                      for -- so this milestone ends with a human watching the
+ *                      motor. */
+#define MOTOR_MODE_FORCED_RAMP     5
 
 #ifndef MOTOR_BRIDGE_MODE
 #define MOTOR_BRIDGE_MODE MOTOR_MODE_COMPLEMENTARY_A
@@ -47,6 +54,32 @@
  * covers many electrical revolutions. */
 #ifndef SECTOR_STEP_US
 #define SECTOR_STEP_US 1000u
+#endif
+
+/* Forced-commutation ramp. ALIGN holds one sector long enough for the rotor to
+ * settle against it; the sector period then falls linearly from START to END
+ * across the rest of the run. A 1103-class fan motor has very little inertia,
+ * so the ramp can be brisk -- but the first trial should still be the slowest
+ * one that moves at all, because a rotor that cannot keep up just draws
+ * current and heats. */
+#ifndef ALIGN_MS
+#define ALIGN_MS 15u
+#endif
+/* 12 poles, so 6 pole pairs (user-confirmed for this motor). Mechanical rpm =
+ * 60e6 / (6 sectors * sector period us * pole pairs). */
+#ifndef MOTOR_POLE_PAIRS
+#define MOTOR_POLE_PAIRS 6u
+#endif
+
+/* The end of the ramp is set by the campaign's RPM ceiling, not by what the
+ * motor could do: 1700 us per sector is 980 mechanical rpm at 6 pole pairs,
+ * just inside the 1000 rpm the safety policy allows. Raising it is a request
+ * to the user, not a constant to edit. */
+#ifndef RAMP_START_US
+#define RAMP_START_US 4000u
+#endif
+#ifndef RAMP_END_US
+#define RAMP_END_US 1700u
 #endif
 
 /* Dwell per phase-probe step. The divider is 56k/10k into a ~5 pF sample

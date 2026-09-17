@@ -131,10 +131,14 @@ typedef struct {
     uint32_t step;      /* 0 = all off, then A-high, A-low, B-high, ... */
     uint32_t phase;     /* 0..2, or 3 for "no phase driven"             */
     uint32_t high_side; /* 1 = high side driven, 0 = low side           */
-    uint32_t phase_a;   /* raw ADC counts                               */
+    uint32_t phase_a;    /* mean of a burst, raw ADC counts             */
     uint32_t phase_b;
     uint32_t phase_c;
     uint32_t vrefint;
+    uint32_t phase_a_min, phase_a_med, phase_a_max;
+    uint32_t phase_b_min, phase_b_med, phase_b_max;
+    uint32_t phase_c_min, phase_c_med, phase_c_max;
+    uint32_t vrefint_min, vrefint_med, vrefint_max;
     uint32_t ccer;      /* what TIM1 was actually holding               */
 } hil_probe_step_t;
 

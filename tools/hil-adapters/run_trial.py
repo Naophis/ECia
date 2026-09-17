@@ -93,7 +93,7 @@ def symbols(artifact: Path) -> dict[str, int]:
 
 
 def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...],
-                require_sentinels: bool = True) -> dict[str, int]:
+                require_sentinels: bool = True, retries: int = 4) -> dict[str, int]:
     """Read one shared block, checking that all of it arrived.
 
     Blocks like hil_state change while the firmware runs -- uptime_ms advances
@@ -102,6 +102,21 @@ def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...],
     tail came from the wrong address fails the tail check even though the head
     still looks right, which is precisely the corruption this bench produced.
     """
+    for attempt in range(retries + 1):
+        try:
+            return _read_struct_once(session, address, fields, require_sentinels)
+        except AdapterError:
+            # The sentinel did its job: this read did not arrive intact. That is
+            # a transport fault, not a result, so retry it rather than throw the
+            # trial away -- and let it fail for real if it keeps happening.
+            if attempt == retries:
+                raise
+            session.read_retries += 1
+    raise AdapterError("unreachable")
+
+
+def _read_struct_once(session: OpenOCD, address: int, fields: tuple[str, ...],
+                      require_sentinels: bool) -> dict[str, int]:
     words = session.read_block(address, len(fields), verify=False)
     raw = b"".join(word.to_bytes(4, "little") for word in words)
     signed = {"phase_error_ticks"}
@@ -153,9 +168,14 @@ def read_bridge(session: OpenOCD, address: int) -> tuple[dict[str, object] | Non
 
 
 PROBE_HEADER_WORDS = 4
-PROBE_STEP_WORDS = 8
+PROBE_STEP_WORDS = 20
 PROBE_STEP_FIELDS = ("step", "phase", "high_side",
-                     "phase_a", "phase_b", "phase_c", "vrefint", "ccer")
+                     "phase_a", "phase_b", "phase_c", "vrefint",
+                     "phase_a_min", "phase_a_med", "phase_a_max",
+                     "phase_b_min", "phase_b_med", "phase_b_max",
+                     "phase_c_min", "phase_c_med", "phase_c_max",
+                     "vrefint_min", "vrefint_med", "vrefint_max",
+                     "ccer")
 
 
 def read_probe(session: OpenOCD, address: int) -> tuple[dict[str, object] | None, str | None]:
@@ -182,6 +202,10 @@ def read_probe(session: OpenOCD, address: int) -> tuple[dict[str, object] | None
     vrefint_cal = session.read(phase_probe.VREFINT_CAL_ADDR, 16) & 0xFFFF
     report = phase_probe.analyse(steps, vrefint_cal)
     report["vrefint_cal"] = vrefint_cal
+    # Keep the counts as read. Every derived number depends on VREFINT, so a
+    # report without the raw values cannot be re-examined afterwards -- which
+    # is exactly the position the first two probe trials left.
+    report["raw_steps"] = steps
     return report, None
 
 
@@ -386,6 +410,19 @@ def main(argv: list[str]) -> int:
 
         # Read the capture before resetting: `reset halt` leaves SRAM intact
         # only because startup never runs, which is a thin guarantee to lean on.
+        probe = None
+        if "hil_probe" in table:
+            probe, probe_error = read_probe(session, table["hil_probe"])
+            evidence["phase_probe"] = probe if probe else {"unavailable": probe_error}
+
+        bridge = None
+        if "hil_bridge" in table:
+            bridge, bridge_error = read_bridge(session, table["hil_bridge"])
+            evidence["bridge_table"] = bridge if bridge else {"unavailable": bridge_error}
+
+        # Captures last: they are the biggest transfer and the one most
+        # likely to fail, and losing them must not cost the measurements
+        # the trial was actually for.
         # Each port is a separate DMA stream and therefore a separate block.
         # They are sampled off one TIM7 update, so the three are comparable.
         captures: dict[str, dict[str, object]] = {}
@@ -401,16 +438,6 @@ def main(argv: list[str]) -> int:
         evidence["captures"] = captures
         if unavailable:
             evidence["captures_unavailable"] = unavailable
-
-        probe = None
-        if "hil_probe" in table:
-            probe, probe_error = read_probe(session, table["hil_probe"])
-            evidence["phase_probe"] = probe if probe else {"unavailable": probe_error}
-
-        bridge = None
-        if "hil_bridge" in table:
-            bridge, bridge_error = read_bridge(session, table["hil_bridge"])
-            evidence["bridge_table"] = bridge if bridge else {"unavailable": bridge_error}
 
         # TIM1's period registers are the ground truth the capture timebase is
         # checked against. Read them while the bridge is still configured.
@@ -462,7 +489,12 @@ def main(argv: list[str]) -> int:
                 {"status": "fault", "signature": "gate-overlap-detected",
                  "overlap_samples": overlap},
                 evidence, trial_id)
-        if probe is not None and not probe["ok"]:
+        # The per-FET verdict only means anything for the phase-probe sweep,
+        # where each step drives one gate. Other modes reuse the same block to
+        # carry sampled phase voltages and are judged by their own numbers.
+        probe_is_fet_sweep = bool(probe) and any(
+            step["phase"] < 3 for step in probe.get("raw_steps", []))
+        if probe is not None and probe_is_fet_sweep and not probe["ok"]:
             return finish(
                 {"status": "retryable", "signature": "phase-probe-failed",
                  "vin_mv": probe["vin_mv"],

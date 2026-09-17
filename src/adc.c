@@ -10,6 +10,13 @@
 #define CH_PHASE_C 13u
 #define CH_VREFINT 18u
 
+/* ADC_CCR.PRESC encoding: 0=/1 1=/2 2=/4 3=/6 4=/8 5=/10 6=/12 7=/16 ...
+ * 4 gives SYSCLK/8 = 21.25 MHz, half the previous 42.5 MHz. */
+#ifndef ADC_PRESC
+#define ADC_PRESC 4u
+#endif
+#define ADC_CLOCK_HZ (SYSCLK_HZ / 8u)
+
 static void wait_cycles(uint32_t cycles)
 {
     while (cycles--) {
@@ -44,6 +51,17 @@ void adc_init(void)
     RCC->AHB2ENR |= RCC_AHB2ENR_ADC12EN;
     (void)RCC->AHB2ENR;
 
+    /* Asynchronous clock (CKMODE = 0) taken from SYSCLK and divided by PRESC,
+     * rather than the synchronous HCLK/4 path. HCLK/4 is 42.5 MHz and offers
+     * no way to go slower; PRESC does. Every conversion on every channel --
+     * the internal reference included -- came back with a +-25 % spread at
+     * 42.5 MHz, and whether that is the conversion outrunning the 8.5 kOhm
+     * divider or noise on the reference itself is decided by changing this
+     * number and nothing else. */
+    /* Back to the synchronous HCLK/4 path. The asynchronous clock at half the
+     * rate produced the same spread, so the slower conversion bought nothing
+     * -- and the faster one buys sample count, which is what actually narrows
+     * a mean. */
     ADC12_COMMON->CCR = ADC_CCR_VREFEN | (2u << ADC_CCR_CKMODE_Pos); /* HCLK/4 */
 
     enable_adc(ADC1);
@@ -60,10 +78,40 @@ static uint16_t convert(ADC_TypeDef *adc, uint32_t channel)
     return (uint16_t)(adc->DR & 0xFFFFu);
 }
 
+static void burst(ADC_TypeDef *adc, uint32_t channel, adc_stat_t *stat)
+{
+    uint16_t values[ADC_BURST];
+    uint32_t total = 0u;
+
+    /* The first conversion after a channel change carries whatever charge the
+     * previous channel left on the sample capacitor, so it is thrown away
+     * rather than counted. */
+    (void)convert(adc, channel);
+
+    /* Insertion sort as the samples arrive: ADC_BURST is small, this runs
+     * outside any control path, and it gives the median for free. */
+    for (uint32_t index = 0u; index < ADC_BURST; index++) {
+        const uint16_t value = convert(adc, channel);
+        total += value;
+        uint32_t slot = index;
+        while (slot > 0u && values[slot - 1u] > value) {
+            values[slot] = values[slot - 1u];
+            slot--;
+        }
+        values[slot] = value;
+    }
+
+    stat->min = values[0];
+    stat->max = values[ADC_BURST - 1u];
+    stat->mean = (uint16_t)(total / ADC_BURST);
+    stat->median = (uint16_t)(((uint32_t)values[ADC_BURST / 2u - 1u]
+                               + values[ADC_BURST / 2u]) / 2u);
+}
+
 void adc_read(adc_sample_t *sample)
 {
-    sample->phase_a = convert(ADC2, CH_PHASE_A);
-    sample->phase_b = convert(ADC2, CH_PHASE_B);
-    sample->phase_c = convert(ADC2, CH_PHASE_C);
-    sample->vrefint = convert(ADC1, CH_VREFINT);
+    burst(ADC2, CH_PHASE_A, &sample->phase_a);
+    burst(ADC2, CH_PHASE_B, &sample->phase_b);
+    burst(ADC2, CH_PHASE_C, &sample->phase_c);
+    burst(ADC1, CH_VREFINT, &sample->vrefint);
 }

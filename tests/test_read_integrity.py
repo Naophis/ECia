@@ -36,6 +36,7 @@ class StubSession:
     def __init__(self, words, corrupt_tail=0):
         self.words = list(words)
         self.corrupt_tail = corrupt_tail
+        self.read_retries = 0
 
     def read_block(self, address, count, verify=True):
         offset = (address - BASE) // 4
@@ -54,13 +55,28 @@ class SentinelTests(unittest.TestCase):
     def test_a_corrupted_tail_is_refused_even_though_the_head_is_perfect(self):
         session = StubSession(state_words(), corrupt_tail=4)
         with self.assertRaises(AdapterError) as caught:
-            run_trial.read_struct(session, BASE, run_trial.STATE_FIELDS)
+            run_trial.read_struct(session, BASE, run_trial.STATE_FIELDS, retries=2)
         self.assertIn("tail magic", str(caught.exception))
+        # Retried before giving up: a bad read is a transport fault, not a result.
+        self.assertEqual(session.read_retries, 2)
+
+    def test_a_tail_that_is_only_briefly_wrong_is_retried_and_accepted(self):
+        session = StubSession(state_words(), corrupt_tail=4)
+
+        original = session.read_block
+
+        def recover(address, count, verify=True):
+            session.corrupt_tail = 0  # the next read comes back clean
+            return original(address, count, verify)
+
+        session.read_block = recover
+        state = run_trial.read_struct(session, BASE, run_trial.STATE_FIELDS, retries=2)
+        self.assertEqual(state["tail_magic"], run_trial.HIL_TAIL_MAGIC)
 
     def test_a_wrong_head_magic_is_refused(self):
         session = StubSession(state_words(magic=0x12345678))
         with self.assertRaises(AdapterError) as caught:
-            run_trial.read_struct(session, BASE, run_trial.STATE_FIELDS)
+            run_trial.read_struct(session, BASE, run_trial.STATE_FIELDS, retries=1)
         self.assertIn("head magic", str(caught.exception))
 
     def test_the_boot_poll_may_see_an_uninitialised_block_without_raising(self):

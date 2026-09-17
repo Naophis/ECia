@@ -274,12 +274,14 @@ class OpenOCD:
             f"read {address:#x}: {words} words never read back the same twice "
             f"({self.verify_retries} retries)")
 
-    def read_bytes(self, address: int, length: int, chunk_words: int = 1024) -> bytes:
+    def read_bytes(self, address: int, length: int, chunk_words: int = 512) -> bytes:
         """Word-sized reads of an aligned block, in chunks.
 
         One `read_memory` for the whole buffer would return tens of kilobytes
         of decimal text in a single Tcl reply; chunking keeps each reply small
-        without paying a per-word AP transaction.
+        without paying a per-word AP transaction. 512 words is the size this
+        probe has read reliably; at 1024 a chunk failed to read back the same
+        twice and cost a trial.
         """
         if address % 4:
             raise AdapterError(f"read_bytes needs a word-aligned address, got {address:#x}")
