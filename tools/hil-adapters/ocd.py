@@ -168,6 +168,20 @@ class OpenOCD:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    def log_text(self) -> str:
+        """Everything OpenOCD has logged so far.
+
+        Commands driven over the Tcl port answer with their *return value*,
+        which for several of them (`program` above all) is an empty string --
+        the verdict goes to the log. Callers that need the verdict take the
+        length of this before the command and slice from there afterwards.
+        """
+        try:
+            self.log.flush()
+            return Path(self.log.name).read_text(errors="replace")
+        except OSError:
+            return ""
+
     def log_tail(self, lines: int = 25) -> str:
         try:
             self.log.flush()

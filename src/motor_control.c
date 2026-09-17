@@ -16,6 +16,7 @@ static uint32_t run_limit_ms;
 static uint32_t sector;
 static uint32_t sector_timer_us;
 static uint32_t active_seq;
+static bool capture_pending;
 
 void motor_control_init(void)
 {
@@ -26,6 +27,7 @@ void motor_control_init(void)
     sector = 0u;
     sector_timer_us = 0u;
     active_seq = 0u;
+    capture_pending = false;
 
     hil_state.state = MOTOR_STOP;
     hil_state.fault = FAULT_NONE;
@@ -40,6 +42,7 @@ static void stop_bridge(uint32_t fault)
 {
     motor_hw_disable();
     motor_hw_set_duty(0u);
+    capture_pending = false;
     capture_poll(); /* keep whatever the DMA already collected */
     capture_abort();
 
@@ -93,9 +96,11 @@ static void start_bridge(void)
     hil_state.moe = 1u;
     hil_state.state = MOTOR_FORCED_START;
 
-    /* Arm the capture after the bridge is live so the window holds steady
-     * state rather than the first switching edge. */
-    capture_start(active_seq);
+    /* Arm the capture on the *next* tick, not this one. CCRx and CCMRx are
+     * preloaded, so they only take effect on the following update event --
+     * capturing immediately would put up to one PWM period of transition
+     * (31 us, 13 % of the 241 us window) into the measurement. */
+    capture_pending = true;
 }
 
 static void advance_sector(void)
@@ -145,7 +150,12 @@ void motor_control_tick_1khz(void)
     run_ms++;
     hil_state.run_ms = run_ms;
     advance_sector();
-    capture_poll();
+    if (capture_pending) {
+        capture_pending = false;
+        capture_start(active_seq);
+    } else {
+        capture_poll();
+    }
 
     if (run_ms >= run_limit_ms) {
         stop_bridge(FAULT_NONE);

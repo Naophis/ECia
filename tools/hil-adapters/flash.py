@@ -19,6 +19,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ocd import AdapterError, OpenOCD, bridge_off, emit, identify_silicon, require_single_probe  # noqa: E402
 
 
+def program_verdict(log: str) -> str | None:
+    """None if this program+verify succeeded, else why it did not.
+
+    Only the log slice that *this* command produced may be passed in: an
+    earlier "Verified OK" from a previous flash in the same session would
+    otherwise vouch for a flash that never happened.
+
+    A bare "Error:" line is deliberately not treated as failure. Verification
+    compares the programmed flash byte for byte, so it is the authority on
+    whether the image landed; failing the flash on an incidental error line
+    would latch a campaign fault for no reason, and a latched fault costs a
+    human round-trip to clear.
+    """
+    for marker in ("** Programming Failed **", "** Verify Failed **"):
+        if marker in log:
+            return f"openocd reported {marker.strip('* ')}"
+    if "** Verified OK **" not in log:
+        return "program/verify did not confirm"
+    return None
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         emit({"status": "error", "error": "usage: flash.py <artifact.elf> <probe_serial>"})
@@ -45,9 +66,18 @@ def main(argv: list[str]) -> int:
         # that is currently driving it.
         bridge_off(session)
 
+        # `program` answers the Tcl port with an empty string on success: its
+        # progress and its verdict are written to OpenOCD's own log, not
+        # returned. So the verdict has to be read from the log, and only from
+        # the part of it this command produced -- an earlier "Verified OK" from
+        # a previous flash in the same session would otherwise stand in for
+        # this one.
+        log_before = len(session.log_text())
         reply = session.cmd(f"program {{{artifact}}} verify")
-        if "Verified OK" not in reply and "verified" not in reply.lower():
-            raise AdapterError(f"program/verify did not confirm: {reply!r}\n{session.log_tail(15)}")
+        produced = session.log_text()[log_before:]
+        problem = program_verdict(produced)
+        if problem:
+            raise AdapterError(f"{problem} (reply {reply!r}):\n{produced[-2000:]}")
 
         result = bridge_off(session)
         if not result["outputs_off"] or result["state"] != "halted":
