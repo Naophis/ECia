@@ -43,6 +43,18 @@ def main(argv: list[str]) -> int:
         code = run(configure)
         if code != 0:
             return code
+    # Remove the ELF before building. hilctl refuses to flash an artifact whose
+    # mtime and hash are unchanged, to catch a build that silently did nothing
+    # -- but that also rejects a trial whose one change lives outside the
+    # firmware (a host-side analysis fix, a different duty), and every such
+    # rejection disarms the campaign and costs a human re-arm.
+    #
+    # Deleting first makes the check stricter, not weaker: if the build fails
+    # or produces nothing, there is no artifact at all and hilctl stops with
+    # "firmware artifact missing after build" instead of flashing a stale one.
+    artifact = BUILD_DIR / "ecia_bldc.elf"
+    artifact.unlink(missing_ok=True)
+
     build = ["cmake", "--build", str(BUILD_DIR), "-j", str(os.cpu_count() or 1)]
     if len(argv) > 1:
         build += ["--target", argv[1]]

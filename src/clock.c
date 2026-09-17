@@ -15,6 +15,8 @@
 
 #include "clock.h"
 
+#include <stdint.h>
+
 #include "board.h"
 
 /* PLL: HSI16 / M * N / R = 16 / 4 * 85 / 2 = 170 MHz.
@@ -31,6 +33,20 @@ static void spin(uint32_t cycles)
     while (cycles--) {
         __asm__ volatile("nop");
     }
+}
+
+void bringup_debug_window(void)
+{
+    /* SysTick polled, not interrupting, at the HSI16 reset clock. Accurate
+     * enough for a window and it needs nothing configured first. */
+    SysTick->LOAD = (HSI16_HZ / 1000u) - 1u;
+    SysTick->VAL = 0u;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
+    for (uint32_t elapsed = 0u; elapsed < BRINGUP_DEBUG_WINDOW_MS; elapsed++) {
+        while (!(SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk)) {
+        }
+    }
+    SysTick->CTRL = 0u;
 }
 
 void clock_init(void)
@@ -76,6 +92,7 @@ void clock_init(void)
 
 void watchdog_init(void)
 {
+#if ENABLE_IWDG
     /* Freeze the watchdog while the debugger has the core halted. Without
      * this, every halt -- including the one the stop path performs -- would
      * land as a watchdog reset and hide the real reset cause. */
@@ -93,9 +110,12 @@ void watchdog_init(void)
     }
     IWDG->KR = 0xAAAAu; /* reload */
     IWDG->KR = 0xCCCCu; /* start; cannot be stopped again except by reset */
+#endif
 }
 
 void watchdog_kick(void)
 {
+#if ENABLE_IWDG
     IWDG->KR = 0xAAAAu;
+#endif
 }

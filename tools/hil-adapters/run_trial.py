@@ -197,7 +197,9 @@ def main(argv: list[str]) -> int:
         # Boot the firmware. It must come up disarmed with MOE clear; that is
         # checked below before anything is armed.
         session.cmd("resume")
-        deadline = time.time() + 2.0
+        # The firmware opens a bring-up debug window before it configures
+        # anything, so allow for that plus a wide margin.
+        deadline = time.time() + 5.0
         state = {}
         while time.time() < deadline:
             state = read_struct(session, state_address, STATE_FIELDS)

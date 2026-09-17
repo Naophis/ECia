@@ -82,6 +82,23 @@
 #define CAPTURE_PORT      GPIOA
 #define CAPTURE_PORT_IDR  ((uint32_t)&GPIOA->IDR)
 
+/* -------------------------------------------------------------- bring-up -- */
+/* A window at the very top of main(), before the clock tree or any peripheral
+ * is touched, during which the core runs nothing but a counted delay. It costs
+ * half a second per boot and it guarantees the debugger can always attach and
+ * halt -- without it, firmware that faults early and resets can lock the
+ * debugger out entirely, which is exactly how Milestone 1 trial 1 ended. */
+#define BRINGUP_DEBUG_WINDOW_MS 500u
+#define HSI16_HZ 16000000u
+
+/* The independent watchdog turns a single early fault into a permanent reset
+ * loop that no debugger can break into. That trade is right once the control
+ * loop is trusted and wrong during bring-up, so it stays off until the bridge
+ * behaviour is measured, and comes back in Milestone 2. */
+#ifndef ENABLE_IWDG
+#define ENABLE_IWDG 0
+#endif
+
 /* ------------------------------------------------------------- watchdog -- */
 /* LSI is nominally 32 kHz; /8 gives 4 kHz, and RLR 239 gives ~60 ms. The main
  * loop refreshes at 1 kHz, so this only fires if the loop itself stalls. */

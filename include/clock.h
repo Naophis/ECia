@@ -1,5 +1,9 @@
 #pragma once
 
+/* Spin for the bring-up debug window at the reset clock, before anything
+ * else is configured, so the debugger always has a chance to attach. */
+void bringup_debug_window(void);
+
 /* Bring the core to 170 MHz from HSI16 and point VTOR at the vector table. */
 void clock_init(void);
 

@@ -26,6 +26,7 @@ void SysTick_Handler(void)
 
 int main(void)
 {
+    bringup_debug_window();
     clock_init();
     hil_init();
     motor_hw_init();

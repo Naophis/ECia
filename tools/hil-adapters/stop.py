@@ -16,6 +16,7 @@ Usage: stop.py <expected_probe_serial>
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,14 @@ def main(argv: list[str]) -> int:
         probe = require_single_probe(expected_serial)
         session = OpenOCD(timeout=6.0)
         session.cmd("init")
+        if os.environ.get("HIL_CONNECT_UNDER_RESET"):
+            # Recovery path. Attaching with NRST asserted is the only way into
+            # a target stuck in a reset loop, but nothing can be read or
+            # written while reset is held -- so release it straight into a
+            # halt, which catches the core at the reset vector before a single
+            # instruction runs. Peripherals, TIM1 included, come out of that
+            # in their reset state, i.e. outputs off.
+            session.cmd("reset halt")
         result = bridge_off(session)
         emit({"status": "stopped" if result["outputs_off"] else "unconfirmed",
               "probe_serial": probe["serial"], **result})

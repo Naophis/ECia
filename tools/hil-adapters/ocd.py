@@ -50,6 +50,9 @@ UID_BASE = 0x1FFF7590
 DEV_ID_G431 = 0x468  # STM32G431/G441 (category 2)
 EXPECTED_FLASH_KB = 128
 
+# Pause after tearing an OpenOCD session down, before the next one starts.
+SESSION_SETTLE_S = 0.15
+
 # ST-LINK USB product IDs (V2, V2-1, V3 family).
 STLINK_PIDS = {"3744", "3748", "374a", "374b", "374d", "374e", "374f", "3752", "3753", "3754"}
 
@@ -135,6 +138,19 @@ class OpenOCD:
         )
         if not Path(OPENOCD).exists():
             raise AdapterError(f"openocd not found at {OPENOCD} (set HIL_OPENOCD)")
+        # Recovery knobs, off unless the environment asks for them. A target
+        # stuck in a reset loop cannot be examined on a normal connect; holding
+        # NRST low while attaching is the standard way in, and a slower SWD
+        # clock helps a marginal link. Both are opt-in so that an ordinary
+        # trial always connects the same way -- and both are passed after the
+        # target script, because reset_config needs the target to exist.
+        recovery: list[str] = []
+        speed = os.environ.get("HIL_ADAPTER_SPEED")
+        if speed:
+            recovery += ["-c", f"adapter speed {int(speed)}"]
+        if os.environ.get("HIL_CONNECT_UNDER_RESET"):
+            recovery += ["-c", "reset_config srst_only srst_nogate connect_assert_srst"]
+
         self.proc = subprocess.Popen(
             [
                 OPENOCD,
@@ -143,6 +159,7 @@ class OpenOCD:
                 "-c", "gdb_port disabled",
                 "-c", "telnet_port disabled",
                 "-f", str(CFG),
+                *recovery,
             ],
             stdout=subprocess.DEVNULL,
             stderr=self.log,
@@ -286,6 +303,13 @@ class OpenOCD:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        # One trial opens four sessions (identify, flash, verify_halted, test)
+        # back to back. Slamming an ST-LINK/V2 with that can wedge its
+        # firmware: it keeps enumerating and still answers with a target
+        # voltage, but every SWD connect then fails until the probe is
+        # physically replugged -- which is how Milestone 1 trial 1 ended.
+        # Costs 0.6 s per trial and removes a failure that needs a human hand.
+        time.sleep(SESSION_SETTLE_S)
         try:
             self.log.close()
         except OSError:
