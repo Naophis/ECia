@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "target": {
+    "expected_mcu": "STM32G431xB",
+    "expected_probe_serial": "37FF71064E57343677A31A43",
+    "identity_pattern": "STM32G431xB",
+    "halted_pattern": "halted",
+    "flash_start": 134217728,
+    "flash_end": 134348800,
+    "firmware_artifact": "build/ecia_bldc.elf",
+    "flash_leaves_target_halted": true,
+    "firmware_starts_disarmed": true
+  },
+  "commands": {
+    "build": ["python3", "tools/hil-adapters/build.py"],
+    "identify": ["python3", "tools/hil-adapters/identify.py", "{probe_serial}"],
+    "flash": ["python3", "tools/hil-adapters/flash.py", "{artifact}", "{probe_serial}"],
+    "verify_halted": ["python3", "tools/hil-adapters/verify_halted.py", "{probe_serial}"],
+    "stop": ["python3", "tools/hil-adapters/stop.py", "{probe_serial}"],
+    "test": [
+      "python3",
+      "tools/hil-adapters/test.py",
+      "{artifact}",
+      "{duty}",
+      "{duration_ms}",
+      "{rpm_limit}",
+      "{trial_id}",
+      "{probe_serial}"
+    ]
+  },
+  "notes": {
+    "expected_mcu": "The die proves family and flash size, not package or temperature grade. identify.py asserts DBGMCU IDCODE DEV_ID == 0x468 and FLASH_SIZE == 128 KiB and reports STM32G431xB. The KBU6 suffix (UFQFPN32) is corroborated by the board itself: PF0 carries TIM1_CH3N, and PF0 is only bonded out on the 32-pin package.",
+    "expected_probe_serial": "ST-LINK/V2, USB 0483:3748, read from /sys/bus/usb/devices/3-4/serial. The descriptor holds a raw 12-byte serial; the adapters convert it to the canonical 24-hex-digit form. OpenOCD's own serial filter is not used, because that binary string cannot be passed through an argv safely -- instead the adapters refuse to run unless exactly one ST-LINK is attached and its serial matches this value.",
+    "flash_range": "STM32G431KB: 128 KiB main flash at 0x08000000..0x08020000. There is no bootloader reservation in this project; the application links at 0x08000000, so the ELF entry point must lie in this range.",
+    "flash_leaves_target_halted": "flash.py clears TIM1 MOE, programs with verify, then issues `reset halt` and reads BDTR/CCER/CR1 back. It never resumes. hilctl checks this independently with verify_halted.py before any bounded test.",
+    "firmware_starts_disarmed": "Enforced by construction in the firmware and re-checked on every trial: test.py resumes the target, waits for hil_state, and fails the trial with signature `firmware-not-disarmed` if state != STOP or TIM1 MOE is set before the arm key is written.",
+    "stop_path": "stop.py halts, clears TIM1 MOE (this is what releases the six MP6540HA gate inputs), zeroes CCER and CR1, then `reset halt`, then reads the registers back and exits nonzero unless the off-state is confirmed. Halting the core alone is not a stop -- TIM1 keeps running and keeps commutating while the CPU is stopped.",
+    "capture": "Not configured. test.py writes the full trial trace to .hil/logs/<trial_id>/test-evidence.json itself, which keeps the fatal capture step out of the loop."
+  }
+}

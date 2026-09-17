@@ -27,13 +27,17 @@ Milestone移行、上限緩和、配線変更、保護解除、観測不能、�
 | `tools/hilctl` | build/identify/flash/test/stopを一元化する安全ラッパー |
 | `tools/hilctl-user` | 人間だけが使う承認・再arm・上限変更ツール |
 | `.hil/` | fail-closedの設定、上限、承認テンプレート |
+| `tools/hil-adapters/` | hilctlが呼ぶローカルadapter（identify / flash / verify_halted / stop / test / build） |
 | `tests/` | ラッパーとHookの回帰テスト |
+| `docs/hardware-mapping.md` | 検証済みのGPIO / AF / TIM1 / COMP / ADC / クロック対応表と出典 |
+| `docs/hil-abi.md` | ホストとファームウェアが共有する`hil_cmd` / `hil_state`の契約 |
+| `docs/milestone-0-report.md` | Milestone 0の調査結果とMilestone 1実装計画 |
 
 導入は [INSTALL.md](INSTALL.md) を参照してください。
 
 ## 重要
 
-- 初期状態の`.hil/config.json`は意図的に未設定で、実機操作は拒否されます。
-- Milestone 0で実リポジトリ、ELF、プローブ、停止経路に合わせて設定します。
+- `.hil/config.json`はMilestone 0でこの基板に合わせて設定済みです。
+- `.hil/safety-policy.json`は人間の所有物です。Claudeは作成も編集もしません。`.hil/safety-policy.template.json`をコピーして配置してください。
 - ソフトウェア保護は、物理電流制限、ロータガード、独立gate-disable、電源遮断手段の代替ではありません。
 - 実機試験中は人が即座に電源を切れる状態を維持してください。

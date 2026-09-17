@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./tools/hilctl:*)",
+      "Bash(python3 -m unittest:*)"
+    ],
+    "deny": [
+      "Bash(./tools/hilctl-user:*)",
+      "Edit(./.hil/approval.json)",
+      "Write(./.hil/approval.json)",
+      "Edit(./.hil/safety-policy.json)",
+      "Write(./.hil/safety-policy.json)",
+      "Edit(./.hil/runtime.json)",
+      "Write(./.hil/runtime.json)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_hardware.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/record_trial.py\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/continue_hil_loop.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

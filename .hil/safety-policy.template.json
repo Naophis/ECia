@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "_comment": "Template only. .hil/safety-policy.json is user-owned: Claude never creates or edits it. Copy this file into place once, then change the ceilings only with ./tools/hilctl-user set-limits. Values below are sized for Milestone 1, where the motor is NOT connected and only TIM1 waveforms are observed.",
+  "max_duty_percent": 10,
+  "max_duration_ms": 2000,
+  "max_rpm": 1000,
+  "max_trials_per_campaign": 20,
+  "same_failure_limit": 3,
+  "safe_retry_exit_codes": []
+}
