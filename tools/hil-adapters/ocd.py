@@ -231,14 +231,48 @@ class OpenOCD:
             raise AdapterError(f"{what}: openocd said {reply!r}") from None
 
     def read(self, address: int, width: int = 32) -> int:
-        return self._numbers(
-            self.cmd(f"read_memory {address:#x} {width} 1"), f"read {address:#x}"
-        )[0]
+        first = self._numbers(
+            self.cmd(f"read_memory {address:#x} {width} 1"), f"read {address:#x}")[0]
+        for _ in range(self.verify_retries):
+            second = self._numbers(
+                self.cmd(f"read_memory {address:#x} {width} 1"), f"read {address:#x}")[0]
+            if first == second:
+                return first
+            self.read_retries += 1
+            first = second
+        raise AdapterError(f"read {address:#x}: value never read back the same twice")
 
-    def read_block(self, address: int, words: int) -> list[int]:
-        return self._numbers(
+    # Every measurement in this project is a memory read over SWD, so a read
+    # that comes back subtly wrong corrupts a result rather than failing it.
+    # This probe has done exactly that: a 24-word block came back with its tail
+    # stitched together from the wrong addresses, and the firmware's own
+    # disassembly was the only way to tell. So bulk reads are taken twice and
+    # must agree; a disagreement is retried, and a persistent one is an error.
+    verify_retries = 3
+    read_retries = 0
+
+    def _read_once(self, address: int, words: int) -> list[int]:
+        values = self._numbers(
             self.cmd(f"read_memory {address:#x} 32 {words}"), f"read {address:#x}"
         )
+        if len(values) != words:
+            raise AdapterError(
+                f"read {address:#x}: asked for {words} words, got {len(values)}")
+        return values
+
+    def read_block(self, address: int, words: int, verify: bool = True) -> list[int]:
+        first = self._read_once(address, words)
+        if not verify:
+            return first
+        for _ in range(self.verify_retries):
+            second = self._read_once(address, words)
+            if first == second:
+                return first
+            self.read_retries += 1
+            first = second
+        raise AdapterError(
+            f"read {address:#x}: {words} words never read back the same twice "
+            f"({self.verify_retries} retries)")
 
     def read_bytes(self, address: int, length: int, chunk_words: int = 1024) -> bytes:
         """Word-sized reads of an aligned block, in chunks.
@@ -256,6 +290,10 @@ class OpenOCD:
             for word in self.read_block(address + offset * 4, count):
                 data += (word & 0xFFFFFFFF).to_bytes(4, "little")
         return bytes(data[:length])
+
+    def read_health(self) -> dict[str, int]:
+        """How many reads had to be retried to agree. Zero is the expectation."""
+        return {"read_retries": self.read_retries}
 
     def write(self, address: int, value: int, width: int = 32) -> None:
         masked = value & ((1 << width) - 1)

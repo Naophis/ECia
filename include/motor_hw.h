@@ -34,6 +34,13 @@ void motor_hw_set_bridge(enum phase_drive a, enum phase_drive b, enum phase_driv
  * the dead time; the six-step drive never uses it. */
 void motor_hw_set_complementary_a(void);
 
+/* Drive exactly one gate of one phase at 100 %, with both gates of the other
+ * two phases off. With the other phases high-impedance there is no return path
+ * through the motor, so this energises a gate without energising a winding --
+ * which is what makes it safe on a board whose motor cannot be unsoldered.
+ * phase is 0..2 for A..C. */
+void motor_hw_drive_single_gate(uint32_t phase, bool high_side);
+
 /* Read back the three registers that define the bridge state. Used to record
  * what each sector actually programmed, with the outputs disabled. */
 void motor_hw_read_bridge(uint32_t *ccer, uint32_t *ccmr1, uint32_t *ccmr2);

@@ -12,6 +12,7 @@
 volatile hil_cmd_t hil_cmd;
 volatile hil_state_t hil_state;
 volatile hil_bridge_t hil_bridge;
+volatile hil_probe_t hil_probe;
 volatile hil_capture_t hil_capture;
 volatile hil_capture_t hil_capture_b;
 volatile hil_capture_t hil_capture_f;
@@ -36,6 +37,7 @@ void hil_init(void)
     hil_cmd.duration_ms = 0u;
     hil_cmd.rpm_limit = 0u;
     hil_cmd.seq = 0u;
+    hil_cmd.tail_magic = HIL_TAIL_MAGIC;
     hil_cmd.abi_version = HIL_ABI_VERSION;
     /* Magic last: the host polls it to decide the block is live, so it must
      * not become valid before the rest of the fields are. */
@@ -47,6 +49,7 @@ void hil_init(void)
     hil_state.moe = 0u;
     hil_state.build_id = BUILD_ID;
     hil_state.mode = MOTOR_BRIDGE_MODE;
+    hil_state.tail_magic = HIL_TAIL_MAGIC;
     hil_state.abi_version = HIL_ABI_VERSION;
     hil_state.magic = HIL_MAGIC;
 

@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "hil.h"
 #include "motor_commutation.h"
+#include "adc.h"
 #include "motor_hw.h"
 
 /* Every limit that matters lives here rather than on the host. A host crash, a
@@ -17,6 +18,8 @@ static uint32_t sector;
 static uint32_t sector_timer_us;
 static uint32_t active_seq;
 static bool capture_pending;
+static uint32_t probe_step;
+static uint32_t probe_step_ms;
 
 static void probe_bridge_table(void)
 {
@@ -39,6 +42,7 @@ static void probe_bridge_table(void)
     }
 
     motor_hw_disable();
+    hil_bridge.tail_magic = HIL_TAIL_MAGIC;
     hil_bridge.abi_version = HIL_ABI_VERSION;
     hil_bridge.magic = HIL_MAGIC;
 }
@@ -53,6 +57,8 @@ void motor_control_init(void)
     sector_timer_us = 0u;
     active_seq = 0u;
     capture_pending = false;
+    probe_step = 0u;
+    probe_step_ms = 0u;
 
     hil_state.state = MOTOR_STOP;
     hil_state.fault = FAULT_NONE;
@@ -63,7 +69,76 @@ void motor_control_init(void)
     hil_state.moe = 0u;
 
     probe_bridge_table();
+    adc_init();
 }
+
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+/* Step 0 is the undriven baseline; steps 1..6 walk A-high, A-low, B-high,
+ * B-low, C-high, C-low; step 7 returns to undriven. */
+static void probe_gate_for_step(uint32_t step, uint32_t *phase, uint32_t *high_side)
+{
+    if (step == 0u || step > 6u) {
+        *phase = 3u; /* none */
+        *high_side = 0u;
+        return;
+    }
+    *phase = (step - 1u) / 2u;
+    *high_side = ((step - 1u) % 2u) == 0u;
+}
+
+static void apply_probe_step(uint32_t step)
+{
+    uint32_t phase, high_side;
+    probe_gate_for_step(step, &phase, &high_side);
+    motor_hw_drive_single_gate(phase, high_side != 0u);
+}
+
+static void record_probe_step(uint32_t step)
+{
+    if (step >= HIL_PROBE_STEPS) {
+        return;
+    }
+    uint32_t phase, high_side;
+    probe_gate_for_step(step, &phase, &high_side);
+
+    adc_sample_t sample;
+    adc_read(&sample);
+
+    uint32_t ccer, ccmr1, ccmr2;
+    motor_hw_read_bridge(&ccer, &ccmr1, &ccmr2);
+
+    hil_probe.step[step].step = step;
+    hil_probe.step[step].phase = phase;
+    hil_probe.step[step].high_side = high_side;
+    hil_probe.step[step].phase_a = sample.phase_a;
+    hil_probe.step[step].phase_b = sample.phase_b;
+    hil_probe.step[step].phase_c = sample.phase_c;
+    hil_probe.step[step].vrefint = sample.vrefint;
+    hil_probe.step[step].ccer = ccer;
+}
+
+static void advance_probe(void)
+{
+    if (probe_step >= HIL_PROBE_STEPS) {
+        return;
+    }
+    probe_step_ms++;
+    if (probe_step_ms < PROBE_STEP_MS) {
+        return;
+    }
+    probe_step_ms = 0u;
+
+    /* Read at the end of the dwell, then move on. */
+    record_probe_step(probe_step);
+    probe_step++;
+    if (probe_step < HIL_PROBE_STEPS) {
+        apply_probe_step(probe_step);
+    } else {
+        motor_hw_drive_single_gate(3u, false); /* park undriven */
+        hil_probe.complete = 1u;
+    }
+}
+#endif
 
 static void stop_bridge(uint32_t fault)
 {
@@ -117,6 +192,15 @@ static void start_bridge(void)
 
 #if MOTOR_BRIDGE_MODE == MOTOR_MODE_COMPLEMENTARY_A
     motor_hw_set_complementary_a();
+#elif MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+    hil_probe.count = HIL_PROBE_STEPS;
+    hil_probe.complete = 0u;
+    hil_probe.tail_magic = HIL_TAIL_MAGIC;
+    hil_probe.abi_version = HIL_ABI_VERSION;
+    hil_probe.magic = HIL_MAGIC;
+    probe_step = 0u;
+    probe_step_ms = 0u;
+    apply_probe_step(0u);
 #else
     commutation_apply(sector);
 #endif
@@ -179,6 +263,9 @@ void motor_control_tick_1khz(void)
     run_ms++;
     hil_state.run_ms = run_ms;
     advance_sector();
+#if MOTOR_BRIDGE_MODE == MOTOR_MODE_PHASE_PROBE
+    advance_probe();
+#endif
     if (capture_pending) {
         capture_pending = false;
         capture_start(active_seq);

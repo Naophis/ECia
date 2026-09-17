@@ -15,6 +15,13 @@
 #define HIL_CAPTURE_MAGIC 0x434C4948u /* "HILC" */
 #define HIL_ABI_VERSION   1u
 #define HIL_ARM_KEY       0xA5C35A3Cu
+/* Every block carries this as its last word. A bulk SWD read that comes back
+ * stitched together from the wrong addresses -- which this bench's probe has
+ * done -- corrupts the tail of the block while the head still looks perfect,
+ * so checking only a leading magic proves nothing about the fields that
+ * matter. The head says "this is the block"; the tail says "and you read all
+ * of it". */
+#define HIL_TAIL_MAGIC    0x4C494154u /* "TAIL" */
 
 enum hil_request {
     HIL_REQUEST_IDLE = 0,
@@ -52,6 +59,7 @@ typedef struct {
     uint32_t duration_ms;
     uint32_t rpm_limit;
     uint32_t seq;
+    uint32_t tail_magic;
 } hil_cmd_t;
 
 typedef struct {
@@ -79,6 +87,7 @@ typedef struct {
     uint32_t moe;
     uint32_t build_id;
     uint32_t mode; /* compile-time bridge mode this build runs; see motor_control.h */
+    uint32_t tail_magic;
 } hil_state_t;
 
 typedef struct {
@@ -109,9 +118,36 @@ typedef struct {
     uint32_t count;
     uint32_t moe_while_probing; /* must read 0: probing never energises */
     hil_bridge_sector_t sector[6];
+    uint32_t tail_magic;
 } hil_bridge_t;
 
 extern volatile hil_bridge_t hil_bridge;
+
+/* One entry per drive state of the phase-probe sweep: which single gate was
+ * driven, and what the three BEMF dividers read while it was. */
+#define HIL_PROBE_STEPS 8u
+
+typedef struct {
+    uint32_t step;      /* 0 = all off, then A-high, A-low, B-high, ... */
+    uint32_t phase;     /* 0..2, or 3 for "no phase driven"             */
+    uint32_t high_side; /* 1 = high side driven, 0 = low side           */
+    uint32_t phase_a;   /* raw ADC counts                               */
+    uint32_t phase_b;
+    uint32_t phase_c;
+    uint32_t vrefint;
+    uint32_t ccer;      /* what TIM1 was actually holding               */
+} hil_probe_step_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t abi_version;
+    uint32_t count;
+    uint32_t complete;
+    hil_probe_step_t step[HIL_PROBE_STEPS];
+    uint32_t tail_magic;
+} hil_probe_t;
+
+extern volatile hil_probe_t hil_probe;
 
 extern volatile hil_cmd_t hil_cmd;
 extern volatile hil_state_t hil_state;

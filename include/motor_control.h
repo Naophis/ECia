@@ -28,6 +28,15 @@
 #define MOTOR_MODE_COMPLEMENTARY_A 1
 #define MOTOR_MODE_SECTOR_HOLD     2
 #define MOTOR_MODE_SECTOR_STEP     3
+/*   4 PHASE_PROBE      drives one gate at a time at 100 %, with the other two
+ *                      phases high-impedance, and reads the three BEMF
+ *                      dividers at each step. No return path exists through
+ *                      the motor, so all six FETs are verified individually
+ *                      and VIN is measured, without a single milliamp in a
+ *                      winding. This is the prerequisite for Milestone 2: it
+ *                      proves the power stage follows the gates before any
+ *                      commutation puts current through the motor. */
+#define MOTOR_MODE_PHASE_PROBE     4
 
 #ifndef MOTOR_BRIDGE_MODE
 #define MOTOR_BRIDGE_MODE MOTOR_MODE_COMPLEMENTARY_A
@@ -38,6 +47,13 @@
  * covers many electrical revolutions. */
 #ifndef SECTOR_STEP_US
 #define SECTOR_STEP_US 1000u
+#endif
+
+/* Dwell per phase-probe step. The divider is 56k/10k into a ~5 pF sample
+ * capacitor, so the node itself settles in microseconds; 5 ms is about the
+ * gate driver's charge pump and about leaving the reading obviously static. */
+#ifndef PROBE_STEP_MS
+#define PROBE_STEP_MS 5u
 #endif
 
 void motor_control_init(void);

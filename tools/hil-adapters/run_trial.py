@@ -28,12 +28,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bridge_check  # noqa: E402
+import phase_probe  # noqa: E402
 from gate_analysis import Channel, analyse, check_timebase  # noqa: E402
 from ocd import ROOT, TIM1_ARR, TIM1_BDTR, TIM1_PSC, TIM_BDTR_MOE  # noqa: E402
 from ocd import AdapterError, OpenOCD, bridge_off, emit, require_single_probe  # noqa: E402
 
 
 HIL_MAGIC = 0x314C4948  # 'HIL1'
+HIL_TAIL_MAGIC = 0x4C494154  # 'TAIL', last word of every block
 HIL_CAPTURE_MAGIC = 0x434C4948  # 'HILC'
 CAPTURE_HEADER_WORDS = 8
 
@@ -60,6 +62,7 @@ STATE_NAMES = {
 CMD_FIELDS = (
     "magic", "abi_version", "arm_key", "request",
     "duty_milli", "duration_ms", "rpm_limit", "seq",
+    "tail_magic",
 )
 STATE_FIELDS = (
     "magic", "abi_version", "seq_ack", "state", "fault", "uptime_ms", "run_ms",
@@ -67,6 +70,7 @@ STATE_FIELDS = (
     "valid_zc", "rejected_zc", "early_zc", "late_zc", "lost_zc",
     "t60_raw_ticks", "t60_filt_ticks", "phase_error_ticks", "rpm_est",
     "startup_count", "startup_failure_count", "moe", "build_id", "mode",
+    "tail_magic",
 )
 # 50 ms, not 20: the trace is for shape, not resolution, and every poll is
 # another USB transaction on a probe that has proven fragile under load.
@@ -88,14 +92,31 @@ def symbols(artifact: Path) -> dict[str, int]:
     return table
 
 
-def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...]) -> dict[str, int]:
-    words = session.read_block(address, len(fields))
+def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...],
+                require_sentinels: bool = True) -> dict[str, int]:
+    """Read one shared block, checking that all of it arrived.
+
+    Blocks like hil_state change while the firmware runs -- uptime_ms advances
+    every millisecond -- so they cannot be validated by reading them twice.
+    They are validated by their head and tail magics instead: a bulk read whose
+    tail came from the wrong address fails the tail check even though the head
+    still looks right, which is precisely the corruption this bench produced.
+    """
+    words = session.read_block(address, len(fields), verify=False)
     raw = b"".join(word.to_bytes(4, "little") for word in words)
     signed = {"phase_error_ticks"}
     values = {}
     for index, name in enumerate(fields):
         chunk = raw[index * 4:index * 4 + 4]
         values[name] = struct.unpack("<i" if name in signed else "<I", chunk)[0]
+    if require_sentinels:
+        if values.get("magic") != HIL_MAGIC:
+            raise AdapterError(
+                f"read {address:#x}: head magic {values.get('magic'):#010x} is wrong")
+        if values.get("tail_magic") != HIL_TAIL_MAGIC:
+            raise AdapterError(
+                f"read {address:#x}: tail magic {values.get('tail_magic'):#010x} is wrong -- "
+                "the block did not arrive intact")
     return values
 
 
@@ -117,13 +138,50 @@ def read_bridge(session: OpenOCD, address: int) -> tuple[dict[str, object] | Non
     if count != len(bridge_check.SPEC_SECTORS):
         return None, f"hil_bridge reports {count} sectors"
 
-    words = session.read_block(address + BRIDGE_HEADER_WORDS * 4, count * BRIDGE_SECTOR_WORDS)
+    words = session.read_block(address + BRIDGE_HEADER_WORDS * 4,
+                               count * BRIDGE_SECTOR_WORDS + 1)
+    if words[-1] != HIL_TAIL_MAGIC:
+        return None, "hil_bridge tail magic is wrong -- the block did not arrive intact"
+    words = words[:-1]
     sectors = [
         {"ccer": words[i * 3], "ccmr1": words[i * 3 + 1], "ccmr2": words[i * 3 + 2]}
         for i in range(count)
     ]
     report = bridge_check.check(sectors)
     report["moe_while_probing"] = moe_while_probing
+    return report, None
+
+
+PROBE_HEADER_WORDS = 4
+PROBE_STEP_WORDS = 8
+PROBE_STEP_FIELDS = ("step", "phase", "high_side",
+                     "phase_a", "phase_b", "phase_c", "vrefint", "ccer")
+
+
+def read_probe(session: OpenOCD, address: int) -> tuple[dict[str, object] | None, str | None]:
+    """Read the phase-probe sweep and turn it into a per-FET verdict."""
+    magic, abi, count, complete = session.read_block(address, PROBE_HEADER_WORDS)
+    if magic != HIL_MAGIC:
+        return None, f"hil_probe magic {magic:#010x} != {HIL_MAGIC:#010x}"
+    if abi != ABI_VERSION:
+        return None, f"hil_probe abi_version {abi} != {ABI_VERSION}"
+    if not complete:
+        return None, f"hil_probe sweep did not finish ({count} steps declared)"
+
+    words = session.read_block(address + PROBE_HEADER_WORDS * 4,
+                               count * PROBE_STEP_WORDS + 1)
+    if words[-1] != HIL_TAIL_MAGIC:
+        return None, "hil_probe tail magic is wrong -- the block did not arrive intact"
+    words = words[:-1]
+    steps = [
+        dict(zip(PROBE_STEP_FIELDS, words[i * PROBE_STEP_WORDS:(i + 1) * PROBE_STEP_WORDS]))
+        for i in range(count)
+    ]
+    # The calibration lives in system memory, not in the firmware image, so it
+    # is read from the target rather than assumed.
+    vrefint_cal = session.read(phase_probe.VREFINT_CAL_ADDR, 16) & 0xFFFF
+    report = phase_probe.analyse(steps, vrefint_cal)
+    report["vrefint_cal"] = vrefint_cal
     return report, None
 
 
@@ -260,8 +318,9 @@ def main(argv: list[str]) -> int:
         deadline = time.time() + 5.0
         state = {}
         while time.time() < deadline:
-            state = read_struct(session, state_address, STATE_FIELDS)
-            if state["magic"] == HIL_MAGIC and state["abi_version"] == ABI_VERSION:
+            state = read_struct(session, state_address, STATE_FIELDS, require_sentinels=False)
+            if (state["magic"] == HIL_MAGIC and state["abi_version"] == ABI_VERSION
+                    and state["tail_magic"] == HIL_TAIL_MAGIC):
                 break
             time.sleep(0.02)
         else:
@@ -272,10 +331,15 @@ def main(argv: list[str]) -> int:
 
         evidence["boot_state"] = dict(state)
         bdtr = session.read(TIM1_BDTR)
-        if state["state"] != 0 or state["moe"] or (bdtr & TIM_BDTR_MOE):
+        # BDTR.MOE read straight from TIM1 is the authority on whether the
+        # bridge is live; hil_state.moe is a software mirror and only
+        # corroborates it. Both must say off, and they must agree.
+        hardware_energised = bool(bdtr & TIM_BDTR_MOE)
+        if hardware_energised or state["state"] != 0 or state["moe"]:
             return finish(
                 {"status": "fault", "signature": "firmware-not-disarmed",
-                 "error": f"firmware came up energised: state={state['state']} bdtr={bdtr:#x}"},
+                 "error": f"firmware came up energised: state={state['state']} "
+                          f"moe_mirror={state['moe']} bdtr={bdtr:#x}"},
                 evidence, trial_id)
 
         # Parameters, then the arm key, then the request word.
@@ -308,6 +372,7 @@ def main(argv: list[str]) -> int:
             session.write(cmd_address + CMD_FIELDS.index("request") * 4, REQUEST_STOP)
             last = read_struct(session, state_address, STATE_FIELDS)
             evidence["final_state"] = dict(last)
+            evidence["link_health"] = session.read_health()
             bridge_off(session)
             return finish(
                 {"status": "fault", "signature": "run-did-not-self-terminate",
@@ -317,6 +382,7 @@ def main(argv: list[str]) -> int:
         session.write(cmd_address + CMD_FIELDS.index("request") * 4, REQUEST_IDLE)
         session.write(cmd_address + CMD_FIELDS.index("arm_key") * 4, 0)
         evidence["final_state"] = dict(last)
+        evidence["link_health"] = session.read_health()
 
         # Read the capture before resetting: `reset halt` leaves SRAM intact
         # only because startup never runs, which is a thin guarantee to lean on.
@@ -335,6 +401,11 @@ def main(argv: list[str]) -> int:
         evidence["captures"] = captures
         if unavailable:
             evidence["captures_unavailable"] = unavailable
+
+        probe = None
+        if "hil_probe" in table:
+            probe, probe_error = read_probe(session, table["hil_probe"])
+            evidence["phase_probe"] = probe if probe else {"unavailable": probe_error}
 
         bridge = None
         if "hil_bridge" in table:
@@ -391,6 +462,13 @@ def main(argv: list[str]) -> int:
                 {"status": "fault", "signature": "gate-overlap-detected",
                  "overlap_samples": overlap},
                 evidence, trial_id)
+        if probe is not None and not probe["ok"]:
+            return finish(
+                {"status": "retryable", "signature": "phase-probe-failed",
+                 "vin_mv": probe["vin_mv"],
+                 "fets": {k: v for k, v in probe["fets"].items() if not v["ok"]}},
+                evidence, trial_id)
+
         if bridge is not None and not bridge["ok"]:
             return finish(
                 {"status": "fault", "signature": "bridge-table-mismatch",
@@ -432,6 +510,12 @@ def main(argv: list[str]) -> int:
                 },
                 "shoot_through_free": True,
                 "timebase": {name: t for name, t in timebase.items() if t.get("checked")},
+            }
+        if probe is not None:
+            summary["phase_probe"] = {
+                "vin_mv": probe["vin_mv"],
+                "all_six_fets_ok": probe["ok"],
+                "fets": {k: v["driven_mv"] for k, v in probe["fets"].items()},
             }
         if bridge is not None:
             summary["bridge_table"] = {

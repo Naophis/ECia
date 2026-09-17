@@ -25,6 +25,7 @@ static void gpio_as_analog(GPIO_TypeDef *port, uint32_t pin)
 }
 
 #define OCM_FORCE_INACTIVE 4u
+#define OCM_FORCE_ACTIVE   5u
 #define OCM_PWM1           6u
 
 void motor_hw_init(void)
@@ -170,6 +171,30 @@ void motor_hw_set_complementary_a(void)
                 | (OCM_FORCE_INACTIVE << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
     TIM1->CCMR2 = (OCM_FORCE_INACTIVE << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
     TIM1->CCER = TIM_CCER_CC1E | TIM_CCER_CC1NE;
+    TIM1->EGR = TIM_EGR_COMG;
+}
+
+void motor_hw_drive_single_gate(uint32_t phase, bool high_side)
+{
+    /* Forcing OCxREF active drives the high side on continuously; forcing it
+     * inactive drives OCxN, the low side, on continuously. Only one enable bit
+     * is ever set, so the pair is never complementary and the dead-time
+     * generator has nothing to do. */
+    const uint32_t mode = high_side ? OCM_FORCE_ACTIVE : OCM_FORCE_INACTIVE;
+    uint32_t modes[3] = {OCM_FORCE_INACTIVE, OCM_FORCE_INACTIVE, OCM_FORCE_INACTIVE};
+    uint32_t ccer = 0u;
+
+    if (phase < 3u) {
+        modes[phase] = mode;
+        static const uint32_t enable[3] = {TIM_CCER_CC1E, TIM_CCER_CC2E, TIM_CCER_CC3E};
+        static const uint32_t enable_n[3] = {TIM_CCER_CC1NE, TIM_CCER_CC2NE, TIM_CCER_CC3NE};
+        ccer = high_side ? enable[phase] : enable_n[phase];
+    }
+
+    TIM1->CCMR1 = (modes[0] << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE
+                | (modes[1] << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
+    TIM1->CCMR2 = (modes[2] << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
+    TIM1->CCER = ccer;
     TIM1->EGR = TIM_EGR_COMG;
 }
 
