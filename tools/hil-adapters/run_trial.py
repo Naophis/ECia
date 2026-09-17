@@ -65,7 +65,7 @@ STATE_FIELDS = (
     "sector", "duty_applied_milli", "commutations",
     "valid_zc", "rejected_zc", "early_zc", "late_zc", "lost_zc",
     "t60_raw_ticks", "t60_filt_ticks", "phase_error_ticks", "rpm_est",
-    "startup_count", "startup_failure_count", "moe", "build_id",
+    "startup_count", "startup_failure_count", "moe", "build_id", "mode",
 )
 SAMPLE_INTERVAL_S = 0.02
 
@@ -291,6 +291,7 @@ def main(argv: list[str]) -> int:
             "rpm_est": last["rpm_est"],
             "duty_applied_percent": last["duty_applied_milli"] / 1000.0,
             "build_id": f"{last['build_id']:08x}",
+            "mode": last["mode"],
         }
         if capture:
             # A capture that shows both gates of a phase high at once means the

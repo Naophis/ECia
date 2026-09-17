@@ -51,6 +51,7 @@ typedef struct {
     uint32_t startup_count, startup_failure_count;
     uint32_t moe;                     /* mirror of TIM1 BDTR.MOE              */
     uint32_t build_id;                /* short git SHA compiled in            */
+    uint32_t mode;                    /* compile-time bridge mode of this build */
 } hil_state_t;
 ```
 
