@@ -27,11 +27,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from gate_analysis import Channel, analyse  # noqa: E402
 from ocd import ROOT, TIM1_BDTR, TIM_BDTR_MOE  # noqa: E402
 from ocd import AdapterError, OpenOCD, bridge_off, emit, require_single_probe  # noqa: E402
 
 
 HIL_MAGIC = 0x314C4948  # 'HIL1'
+HIL_CAPTURE_MAGIC = 0x434C4948  # 'HILC'
+CAPTURE_HEADER_WORDS = 8
+
+# Which gate sits on which bit of each sampled port. See docs/hil-abi.md.
+CAPTURE_PORTS = {
+    0x48000010: {  # GPIOA_IDR
+        "channels": [Channel("LSA", 7), Channel("HSA", 8), Channel("HSB", 9), Channel("HSC", 10)],
+        "phases": [("A", Channel("HSA", 8), Channel("LSA", 7))],
+    },
+    0x48000410: {"channels": [Channel("LSB", 0)], "phases": []},  # GPIOB_IDR
+    0x48001410: {"channels": [Channel("LSC", 0)], "phases": []},  # GPIOF_IDR
+}
 ABI_VERSION = 1
 ARM_KEY = 0xA5C35A3C
 
@@ -81,6 +94,50 @@ def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...]) -> dict
         chunk = raw[index * 4:index * 4 + 4]
         values[name] = struct.unpack("<i" if name in signed else "<I", chunk)[0]
     return values
+
+
+def read_capture(
+    session: OpenOCD, address: int, trial_id: str
+) -> tuple[dict[str, object] | None, str | None]:
+    """Pull the on-chip gate capture and reduce it to Milestone 1 measurements.
+
+    Returns (report, error). A firmware without the capture, or with an empty
+    one, is not an error -- the milestone that needs it is the one that fills
+    it, and earlier milestones should not fail for lacking it.
+    """
+    header = session.read_block(address, CAPTURE_HEADER_WORDS)
+    magic, abi, port_base, samples, capacity, sysclk_hz, ticks, seq = header
+    if magic != HIL_CAPTURE_MAGIC:
+        return None, f"hil_capture magic {magic:#010x} != {HIL_CAPTURE_MAGIC:#010x}"
+    if abi != ABI_VERSION:
+        return None, f"hil_capture abi_version {abi} != {ABI_VERSION}"
+    if not samples:
+        return None, "hil_capture is empty"
+    if samples > capacity:
+        return None, f"hil_capture claims {samples} samples in a {capacity}-entry buffer"
+    port = CAPTURE_PORTS.get(port_base)
+    if port is None:
+        return None, f"hil_capture port_base {port_base:#010x} is not a known GPIO IDR"
+    if not sysclk_hz or not ticks:
+        return None, f"hil_capture timebase is unusable: {sysclk_hz} Hz / {ticks} ticks"
+
+    raw = session.read_bytes(address + CAPTURE_HEADER_WORDS * 4, samples * 2)
+    values = list(struct.unpack(f"<{samples}H", raw))
+
+    directory = ROOT / ".hil" / "logs" / trial_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gate-capture.bin").write_bytes(raw)
+
+    sample_period_ns = ticks / sysclk_hz * 1e9
+    report = analyse(values, port["channels"], sample_period_ns, port["phases"])
+    report.update({
+        "port_base": f"{port_base:#010x}",
+        "sysclk_hz": sysclk_hz,
+        "ticks_per_sample": ticks,
+        "seq": seq,
+        "raw_file": str((directory / "gate-capture.bin").relative_to(ROOT)),
+    })
+    return report, None
 
 
 def finish(payload: dict[str, object], evidence: dict[str, object], trial_id: str) -> int:
@@ -200,6 +257,14 @@ def main(argv: list[str]) -> int:
         session.write(cmd_address + CMD_FIELDS.index("request") * 4, REQUEST_IDLE)
         session.write(cmd_address + CMD_FIELDS.index("arm_key") * 4, 0)
         evidence["final_state"] = dict(last)
+
+        # Read the capture before resetting: `reset halt` leaves SRAM intact
+        # only because startup never runs, which is a thin guarantee to lean on.
+        capture = None
+        if "hil_capture" in table:
+            capture, capture_error = read_capture(session, table["hil_capture"], trial_id)
+            evidence["capture"] = capture if capture else {"unavailable": capture_error}
+
         off = bridge_off(session)
         evidence["bridge_after"] = off
 
@@ -227,6 +292,29 @@ def main(argv: list[str]) -> int:
             "duty_applied_percent": last["duty_applied_milli"] / 1000.0,
             "build_id": f"{last['build_id']:08x}",
         }
+        if capture:
+            # A capture that shows both gates of a phase high at once means the
+            # dead-time configuration is wrong. That is a fault, not a result.
+            if not capture["shoot_through_free"]:
+                return finish(
+                    {"status": "fault", "signature": "gate-overlap-detected",
+                     "overlap_samples": capture["overlap_samples_total"]},
+                    evidence, trial_id)
+            summary["capture"] = {
+                "samples": capture["samples"],
+                "window_us": capture["window_us"],
+                "shoot_through_free": True,
+                "phases": {
+                    name: {
+                        "pwm_hz": round(phase["pwm"]["frequency_hz"], 1),
+                        "duty_percent": round(phase["pwm"]["duty_percent"], 2),
+                        "dead_time_ns": round(phase["dead_time"]["mean_ns"], 1),
+                        "dead_time_edges": phase["dead_time"]["edges"],
+                    }
+                    for name, phase in capture["phases"].items()
+                },
+                "sectors": len(capture["timeline"]),
+            }
         return finish(summary, evidence, trial_id)
     except AdapterError as error:
         if session is not None:

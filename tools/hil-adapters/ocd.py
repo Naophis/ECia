@@ -207,6 +207,23 @@ class OpenOCD:
             self.cmd(f"read_memory {address:#x} 32 {words}"), f"read {address:#x}"
         )
 
+    def read_bytes(self, address: int, length: int, chunk_words: int = 512) -> bytes:
+        """Word-sized reads of an aligned block, in chunks.
+
+        One `read_memory` for the whole buffer would return tens of kilobytes
+        of decimal text in a single Tcl reply; chunking keeps each reply small
+        without paying a per-word AP transaction.
+        """
+        if address % 4:
+            raise AdapterError(f"read_bytes needs a word-aligned address, got {address:#x}")
+        words_total = (length + 3) // 4
+        data = bytearray()
+        for offset in range(0, words_total, chunk_words):
+            count = min(chunk_words, words_total - offset)
+            for word in self.read_block(address + offset * 4, count):
+                data += (word & 0xFFFFFFFF).to_bytes(4, "little")
+        return bytes(data[:length])
+
     def write(self, address: int, value: int, width: int = 32) -> None:
         masked = value & ((1 << width) - 1)
         reply = self.cmd(f"write_memory {address:#x} {width} {{{masked}}}")

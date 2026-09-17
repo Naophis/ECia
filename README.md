@@ -27,10 +27,11 @@ Milestone移行、上限緩和、配線変更、保護解除、観測不能、�
 | `tools/hilctl` | build/identify/flash/test/stopを一元化する安全ラッパー |
 | `tools/hilctl-user` | 人間だけが使う承認・再arm・上限変更ツール |
 | `.hil/` | fail-closedの設定、上限、承認テンプレート |
-| `tools/hil-adapters/` | hilctlが呼ぶローカルadapter（identify / flash / verify_halted / stop / test / build） |
+| `tools/hil-adapters/` | hilctlが呼ぶローカルadapter（identify / flash / verify_halted / stop / run_trial / build）と波形解析 |
 | `tests/` | ラッパーとHookの回帰テスト |
 | `docs/hardware-mapping.md` | 検証済みのGPIO / AF / TIM1 / COMP / ADC / クロック対応表と出典 |
-| `docs/hil-abi.md` | ホストとファームウェアが共有する`hil_cmd` / `hil_state`の契約 |
+| `docs/hil-abi.md` | ホストとファームウェアが共有する`hil_cmd` / `hil_state` / `hil_capture`の契約 |
+| `docs/on-chip-capture.md` | オシロの代わりにMCU内DMAでゲート波形を測る方法 |
 | `docs/milestone-0-report.md` | Milestone 0の調査結果とMilestone 1実装計画 |
 
 導入は [INSTALL.md](INSTALL.md) を参照してください。

@@ -108,7 +108,8 @@ change only on update. `CR2.CCPC = 1` and `CR2.CCUS = 1` so the channel-enable
 bits are preloaded and applied **on a COM event triggered from TIM2's TRGO**,
 never by writing GPIO in sequence and never from the PWM ISR. Dead time in
 `BDTR.DTG`: the 548 ns measured on this board with the same MP6540HA is 93
-ticks at 170 MHz (`DTG = 0x5D`), to be re-verified on the scope in Milestone 1.
+ticks at 170 MHz (`DTG = 0x5D`), measured for real in Milestone 1 by the
+on-chip gate capture.
 `BDTR.OSSI = OSSR = 1` with all `OISx = OISxN = 0`, so clearing `MOE` drives all
 six gate inputs **low** rather than releasing them to float; the six GPIOs also
 get internal pull-downs to cover the window between reset and TIM1 init. TIM1
@@ -179,16 +180,17 @@ that have run on this board:
 | Startup | ESCape32 has no blind ramp (this is why it stalled here); AM32 has one | Explicit ALIGN → forced commutation → ramp → acquire, all parameterised |
 | Observability | UART/configurator protocols | Debug GPIO + a RAM ring buffer + the `hil_cmd`/`hil_state` block read over SWD |
 | Control of limits | Configurator-owned | Firmware-owned and host-bounded; see [hil-abi.md](hil-abi.md) |
-| Dead time | 92 ticks @168 MHz (548 ns) | 93 ticks @170 MHz, re-verified on the scope in Milestone 1 |
+| Dead time | 92 ticks @168 MHz (548 ns) | 93 ticks @170 MHz, measured in Milestone 1 by the on-chip gate capture |
 | Commutation trigger | TIM2 OC3 → TIM1 COM (same mechanism) | Same — this part is confirmed good and is kept |
 
 ---
 
 ## E. Milestone 1 implementation plan
 
-**Scope: TIM1 only. No COMP, no BEMF logic, no motor connected.** Spec §19
-Milestone 1 asks for PWM, dead time, Hi-Z and sector transition to be confirmed
-on the scope.
+**In scope: TIM1 only. No COMP, no BEMF logic, no motor connected.** Spec §19
+Milestone 1 asks for PWM, dead time, Hi-Z and sector transition to be
+confirmed. It assumes an oscilloscope; there is none on this bench, so the
+measurement is made on-chip instead (below).
 
 Files to create (none exist yet):
 
@@ -216,24 +218,51 @@ holds sector 0, then steps sectors 0→5 at a configurable fixed period, and
 returns to `STOP` with `MOE` cleared after `duration_ms`. No BEMF, no COMP, no
 closed loop.
 
-How it will be checked:
+How it will be checked — **there is no oscilloscope on this bench**, so the
+measurement moves into the MCU. Full design in
+[on-chip-capture.md](on-chip-capture.md).
 
-1. **Over SWD, every trial** — `BDTR` (`MOE`, `DTG`), `CCER`/`CCMR1..3`
-   per sector, `ARR`/`CCRx`, TIM1 `CNT` advancing, and `hil_state.sector`
-   stepping. This is automatic evidence in `.hil/logs/<trial_id>/`.
-2. **Through the BEMF dividers, every trial** — ADC on PA0/PA4/PA5 samples the
-   three phase voltages per sector. With the motor disconnected, the source
-   phase should read ≈ VIN·(10/66)·duty, the sink phase ≈ 0, and the floating
-   phase should sit apart from both. That is the same technique that proved the
-   MP6540HA's HS/LS interface on this board, and it makes "Hi-Z" and "sector
-   transition" measurable without a scope. The ADC stays out of the commutation
-   path.
-3. **On the user's oscilloscope** — dead time on a CH1/CH1N pair, the PWM
-   frequency, and the absence of overlap. Dead time in particular cannot be
-   confirmed from registers alone, so Milestone 1 is not complete until the
-   user reports the measurement.
+1. **On-chip gate capture, every trial.** TIM7 triggers a DMA stream from
+   `GPIOA_IDR` into an 8 KiB SRAM buffer at 17 MHz (58.8 ns per sample, 241 us
+   ≈ 7.7 PWM periods). `IDR` reflects the actual pin, so this is the real
+   waveform at the MP6540HA gate inputs: PA8 = HSA, PA7 = LSA, PA9 = HSB,
+   PA10 = HSC. The host reads the buffer back over SWD into
+   `.hil/logs/<trial_id>/`. From one capture:
+   - **PWM** — period and duty of HSA, expected within 1 % / one sample.
+   - **Dead time** — run length with HSA and LSA both low, at every transition
+     in both directions. The sample clock is deliberately incommensurate with
+     the PWM period (531.2 samples per period), so the sampling phase slides
+     and the run-length histogram recovers the width to well under one sample.
+   - **No shoot-through** — `HSA AND LSA` must be zero across the whole
+     capture. Absolute, not statistical.
+   - **Hi-Z** — the floating phase's two gates low for the entire sector.
+   - **Sector transition** — the six patterns in order, all three phases
+     changing within one sample at the COM event, i.e. commutation is atomic.
+   A second change later adds two more DMA channels on the same TIM7 request
+   for `GPIOB_IDR` (PB0 = LSB) and `GPIOF_IDR` (PF0 = LSC).
+2. **Register readback over SWD, every trial** — `BDTR` (`MOE`, `DTG`),
+   `CCER`/`CCMR1..3` per sector, `ARR`/`CCRx`, TIM1 `CNT` advancing,
+   `hil_state.sector` stepping. Cross-checks the capture against what was
+   actually configured.
+3. **BEMF dividers via ADC, as a later change in the same milestone** — an ADC
+   burst on PA0/PA4/PA5 with a held sector confirms the *power stage* follows
+   the gates, not just the MCU pins: source phase peak ≈ VIN·10/66, sink ≈ 0,
+   floating apart from both. The peak also **measures VIN**, which nothing else
+   here can observe.
 
-First trial: `--duty 5 --duration-ms 200 --rpm-limit 0`, motor disconnected.
+What this still cannot see: the MP6540HA's own propagation delay and the phase
+node's switching edges. Two datasheet facts make that acceptable —
+`HSx = LSx = H` yields high impedance rather than shoot-through, and no
+propagation delay is specified at all, only 0.33 V/ns slew (~38 ns at 12.6 V)
+against a ~550 ns dead time. Milestone 1 is therefore complete on measured
+evidence, with that limitation recorded rather than assumed away.
+
+First trial: `--duty 5 --duration-ms 200 --rpm-limit 0`, motor disconnected,
+sector held, gate capture only. Sector stepping is the second trial.
+
+Before the first trial the firmware is built locally with
+`python3 tools/hil-adapters/build.py` — a build failure inside `hilctl trial`
+ends the campaign and costs a re-arm, so the build is made to succeed first.
 
 ---
 
@@ -260,17 +289,19 @@ with serial `37FF71064E57343677A31A43` is attached:
 | `flash.py` | Re-checks the die, clears the bridge, `program … verify`, `reset halt`, reads `BDTR`/`CCER`/`CR1` back. **Never resumes.** |
 | `verify_halted.py` | Observes only — `poll` then `curstate`. Halting here would make the check vacuous. |
 | `stop.py` | Halt → clear `BDTR.MOE` **first** → zero `CCER`/`CR1` → `reset halt` → read back. Nonzero exit unless the off-state is confirmed. |
-| `test.py` | One bounded trial over the [hil-abi](hil-abi.md) block; writes parameters, then the arm key, then the request, so a half-written command can never arm. Saves the full trace to `.hil/logs/<trial_id>/test-evidence.json`. |
+| `run_trial.py` | One bounded trial over the [hil-abi](hil-abi.md) block; writes parameters, then the arm key, then the request, so a half-written command can never arm. Reads the on-chip gate capture back, runs the analysis over it, and saves `test-evidence.json` plus `gate-capture.bin` under `.hil/logs/<trial_id>/`. A capture showing both gates of a phase high fails the trial. |
+| `gate_analysis.py` | PWM, dead time, shoot-through and sector timeline from a capture. Pure host code, unit-tested against synthesised waveforms with known answers. |
 | `build.py` | Configure-once + `cmake --build`. |
 
-`ocd.py` holds the shared plumbing. `capture` is deliberately not configured:
-`test.py` writes its own evidence, which keeps a fatal extra step out of the
-loop.
+`ocd.py` holds the shared plumbing. hilctl's optional `capture` step is
+deliberately not configured: `run_trial.py` writes its own evidence, which keeps
+a fatal extra step out of the loop.
 
 ### Results
 
-- `python3 -m unittest discover -s tests` — **28/28 pass** (8 of them could not
-  run before the hooks were reconstructed).
+- `python3 -m unittest discover -s tests` — **52/52 pass**: the kit's own 28 (8
+  of which could not run before the hooks were reconstructed), plus 24 new ones
+  covering the gate-capture analysis and its readback path.
 - `.hil/config.json` — validated against `hilctl`'s own `doctor` rules
   (placeholder binding, no shell interpreter, no post-flash run, flash range
   `0x08000000`–`0x08020000`): **no issues**.
@@ -299,20 +330,34 @@ energised run.**
    (10 % duty, 2000 ms, 1000 rpm, 20 trials, 3 repeats). `doctor` cannot return
    `ok` until it is in place; that is the first half of the command in the
    handover.
-2. **Dead time cannot be measured over SWD.** Milestone 1 needs the user's
-   oscilloscope for the CH1/CH1N dead time and the absence of overlap.
-3. **VIN and the motor connection are not observable from here.** Milestone 1
-   requires **the motor disconnected** with VIN applied. 3V3 is clearly present
-   (SWD works, and per the board notes 3V3 comes from an LMZM23600 off VIN), so
-   VIN is probably already applied — but that is an inference, not a
-   measurement.
-4. **Resident firmware is unknown.** Something is running with the PLL up and
+2. **No oscilloscope.** Resolved by the on-chip gate capture
+   ([on-chip-capture.md](on-chip-capture.md)), which measures dead time,
+   duty, Hi-Z, sector atomicity and shoot-through at the MCU pins. The residual
+   gap — the gate driver's own propagation delay and the phase-node edges — is
+   bounded by the datasheet, not measured. Recorded, not assumed away.
+3. **VIN and the motor connection are not observable until the ADC step.**
+   Milestone 1 requires **the motor disconnected** with VIN applied. 3V3 is
+   clearly present (SWD works, and per the board notes 3V3 comes from an
+   LMZM23600 off VIN), so VIN is probably applied — but that stays an inference
+   until the ADC burst measures the source-phase peak.
+4. **Automatic synchronous rectification defeats a truly floating phase.** The
+   MP6540HA turns its LS-FET on by itself whenever an off phase is driven below
+   ground, until that current reaches ~zero. Spec §8 requires the floating
+   phase to be genuinely Hi-Z during zero-cross detection, so from Milestone 3
+   the blanking window must outlast the recirculation, not just the switching
+   noise. This is a plausible contributor to the sync failures the ESCape32
+   build had on this board, and it is the first thing to instrument in
+   Milestone 3.
+5. **Resident firmware is unknown.** Something is running with the PLL up and
    APB2 clocks off. It is not driving TIM1, and Milestone 1 will overwrite it.
-5. **Dead-time value is inherited, not measured on this MCU.** 93 ticks
+6. **Dead-time value is inherited, not yet measured on this MCU.** 93 ticks
    @170 MHz comes from 548 ns measured with the same driver at 168 MHz. It is a
-   starting value.
-6. **MP6540HA gate inputs during the reset window.** Between reset and TIM1
-   init the six pins are analog inputs, i.e. floating at the driver. The board
-   has survived many resets, and the design adds GPIO pull-downs plus
-   `OSSI = 1`, but the un-initialised window is not something firmware can
-   fully close.
+   starting value, and Milestone 1's first trial measures the real one.
+7. **The MP6540HA gate inputs during the reset window are safe.** Previously an
+   open risk; the datasheet states the logic inputs have weak internal
+   pull-downs, so the pins floating between reset and TIM1 init leave all
+   outputs high-impedance. Firmware still adds GPIO pull-downs and uses
+   `OSSI = 1` with `OISx = 0`.
+8. **No current measurement of any kind reaches the MCU.** The bench supply's
+   current limit is the only real current protection; MP6540HA's OCP sits at
+   10-17 A, far above anything this motor should draw.

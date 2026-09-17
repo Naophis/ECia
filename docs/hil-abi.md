@@ -1,6 +1,6 @@
 # Host/firmware HIL ABI
 
-`tools/hil-adapters/test.py` drives a bounded trial by writing one command
+`tools/hil-adapters/run_trial.py` drives a bounded trial by writing one command
 block into the running firmware and polling one state block back. Both live in
 RAM and are found by symbol name (`hil_cmd`, `hil_state`) in the ELF, so the
 addresses never need to be pinned in `.hil/config.json` and the config hash
@@ -53,6 +53,44 @@ typedef struct {
     uint32_t build_id;                /* short git SHA compiled in            */
 } hil_state_t;
 ```
+
+## `hil_capture` (target -> host, optional)
+
+The on-chip gate capture described in [on-chip-capture.md](on-chip-capture.md).
+An 8-word header followed by the sample buffer:
+
+```c
+typedef struct {
+    uint32_t magic;             /* HIL_CAPTURE_MAGIC                        */
+    uint32_t abi_version;       /* HIL_ABI_VERSION                          */
+    uint32_t port_base;         /* address sampled, e.g. GPIOA_IDR 0x48000010 */
+    uint32_t samples;           /* valid entries in data[]                  */
+    uint32_t capacity;          /* allocated entries                        */
+    uint32_t sysclk_hz;         /* 170000000                                */
+    uint32_t ticks_per_sample;  /* TIM7 ARR + 1                             */
+    uint32_t seq;               /* hil_cmd.seq of the run that filled it    */
+    uint16_t data[];            /* one GPIO IDR sample per entry            */
+} hil_capture_t;
+```
+
+`HIL_CAPTURE_MAGIC` = `0x434C4948` (`"HILC"` little-endian).
+
+The sample period is `ticks_per_sample / sysclk_hz`. The host reads the header,
+then `samples` 16-bit entries, saves them verbatim to
+`.hil/logs/<trial_id>/gate-capture.bin`, and runs
+`tools/hil-adapters/gate_analysis.py` over them. The symbol is optional: a
+firmware without it simply produces a trial with no capture, not a failure.
+
+Port-to-bit mapping known to the host:
+
+| `port_base` | Bits |
+|---|---|
+| `0x48000010` (GPIOA_IDR) | 7 = LSA, 8 = HSA, 9 = HSB, 10 = HSC |
+| `0x48000410` (GPIOB_IDR) | 0 = LSB |
+| `0x48001410` (GPIOF_IDR) | 0 = LSC |
+
+Only phase A has both of its gates in one port, so it is the phase the dead
+time is measured on.
 
 ## Protocol
 

@@ -58,6 +58,51 @@ therefore generates the dead time itself; no PWM+EN style driving.
 `TIM1_BASE` = `0x40012C00` (`CMSIS`); `BDTR` at `+0x44`, `CCER` at `+0x20`,
 `CR1` at `+0x00`, `CCR5` at `+0x48`, `CCMR3` at `+0x50`.
 
+### MP6540HA behaviour that the firmware must account for
+
+From the MP6540H/MP6540HA datasheet (Rev 1.0), pin table and Table 2. Pin 3 =
+LSA, pin 6 = HSA, matching the `BENCH` result exactly.
+
+| HSx | LSx | Sx |
+|---|---|---|
+| L | L | High impedance |
+| L | H | GND |
+| H | L | VIN |
+| H | H | **High impedance** |
+
+Three consequences:
+
+1. **Both-inputs-high does not cause shoot-through.** The driver blocks it. The
+   MCU dead time is defence in depth, not the only barrier. It is still
+   configured properly -- this is not licence to omit it.
+2. **"The logic inputs have weak internal pull-down resistors."** This closes
+   the reset window: between reset and TIM1 initialisation the six MCU pins are
+   analog inputs and float, and the driver then reads them low, i.e. all
+   outputs high-impedance. GPIO pull-downs in firmware are still configured, as
+   belt and braces.
+3. **Automatic synchronous rectification is always on.** When both FETs of a
+   phase are off and Sx is driven below ground, the LS-FET turns on by itself
+   until the current reaches ~zero (and symmetrically the HS-FET if Sx rises
+   above VIN). **The floating phase is therefore not electrically floating
+   while its current is still decaying.** This is a first-class concern for
+   BEMF zero-cross detection from Milestone 3 onward: the blanking window must
+   outlast the recirculation, not merely the switching noise. It is also a
+   plausible contributor to the sync problems the ESCape32 build had on this
+   board.
+
+Protection: HS and LS OCP thresholds are 10-13-17 A with a 0.4 us deglitch and
+a 10 ms retry; thermal shutdown at 150 degC. For a 1103-class micromouse fan
+motor these are far above any normal operating current, so -- exactly as spec
+§14 says -- MP6540HA's protection is **not** a current regulator. The bench
+supply's own current limit is the real protection.
+
+No propagation-delay figure is specified; only output slew, 0.33 V/ns rising
+and 0.32 V/ns falling (about 38 ns at 12.6 V).
+
+nSLEEP is pulled down internally and must be held high for normal operation; no
+MCU pin drives it on this board, so it is hard-wired. nFAULT is open-drain and
+likewise not routed to the MCU.
+
 ## B. BEMF sensing and virtual neutral
 
 Divider per phase (`SPEC`): phase -> 56 k -> BEMF_x -> 10 k -> GND, i.e.
