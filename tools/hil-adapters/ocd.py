@@ -39,6 +39,8 @@ OPENOCD_SCRIPTS = os.environ.get(
 TIM1_BASE = 0x40012C00
 TIM1_CR1 = TIM1_BASE + 0x00
 TIM1_CCER = TIM1_BASE + 0x20
+TIM1_PSC = TIM1_BASE + 0x28
+TIM1_ARR = TIM1_BASE + 0x2C
 TIM1_BDTR = TIM1_BASE + 0x44
 TIM_BDTR_MOE = 1 << 15
 
@@ -238,7 +240,7 @@ class OpenOCD:
             self.cmd(f"read_memory {address:#x} 32 {words}"), f"read {address:#x}"
         )
 
-    def read_bytes(self, address: int, length: int, chunk_words: int = 512) -> bytes:
+    def read_bytes(self, address: int, length: int, chunk_words: int = 1024) -> bytes:
         """Word-sized reads of an aligned block, in chunks.
 
         One `read_memory` for the whole buffer would return tens of kilobytes

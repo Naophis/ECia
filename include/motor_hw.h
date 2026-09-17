@@ -34,6 +34,10 @@ void motor_hw_set_bridge(enum phase_drive a, enum phase_drive b, enum phase_driv
  * the dead time; the six-step drive never uses it. */
 void motor_hw_set_complementary_a(void);
 
+/* Read back the three registers that define the bridge state. Used to record
+ * what each sector actually programmed, with the outputs disabled. */
+void motor_hw_read_bridge(uint32_t *ccer, uint32_t *ccmr1, uint32_t *ccmr2);
+
 void motor_hw_enable(void);
 void motor_hw_disable(void);
 bool motor_hw_is_enabled(void);

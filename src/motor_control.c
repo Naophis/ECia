@@ -18,6 +18,31 @@ static uint32_t sector_timer_us;
 static uint32_t active_seq;
 static bool capture_pending;
 
+static void probe_bridge_table(void)
+{
+    /* Walk all six sectors with MOE clear and record what TIM1 ends up
+     * holding. Nothing is energised: MOE is the gate, and it stays off for
+     * the whole walk -- which is checked, not assumed, and recorded. */
+    hil_bridge.count = SECTOR_COUNT;
+    hil_bridge.moe_while_probing = 0u;
+
+    for (uint32_t index = 0u; index < SECTOR_COUNT; index++) {
+        commutation_apply(index);
+        uint32_t ccer, ccmr1, ccmr2;
+        motor_hw_read_bridge(&ccer, &ccmr1, &ccmr2);
+        hil_bridge.sector[index].ccer = ccer;
+        hil_bridge.sector[index].ccmr1 = ccmr1;
+        hil_bridge.sector[index].ccmr2 = ccmr2;
+        if (motor_hw_is_enabled()) {
+            hil_bridge.moe_while_probing = 1u;
+        }
+    }
+
+    motor_hw_disable();
+    hil_bridge.abi_version = HIL_ABI_VERSION;
+    hil_bridge.magic = HIL_MAGIC;
+}
+
 void motor_control_init(void)
 {
     motor_hw_disable();
@@ -36,6 +61,8 @@ void motor_control_init(void)
     hil_state.duty_applied_milli = 0u;
     hil_state.commutations = 0u;
     hil_state.moe = 0u;
+
+    probe_bridge_table();
 }
 
 static void stop_bridge(uint32_t fault)
@@ -46,11 +73,12 @@ static void stop_bridge(uint32_t fault)
     capture_poll(); /* keep whatever the DMA already collected */
     capture_abort();
 
-    run_ms = 0u;
     run_limit_ms = 0u;
-    hil_state.duty_applied_milli = 0u;
     hil_state.moe = 0u;
-    hil_state.run_ms = 0u;
+    /* run_ms and duty_applied_milli are deliberately left at the values the
+     * run reached. The host reads this block only after seq_ack lands, so
+     * zeroing them here threw away the evidence of what actually ran; they are
+     * cleared at the start of the next run instead. */
     hil_state.fault = fault;
     hil_state.state = (fault == FAULT_NONE) ? MOTOR_STOP : MOTOR_FAULT;
     /* seq_ack last: it is what tells the host the run is over, so everything
@@ -77,6 +105,7 @@ static void start_bridge(void)
     active_seq = hil_cmd.seq;
     run_limit_ms = hil_cmd.duration_ms;
     run_ms = 0u;
+    hil_state.run_ms = 0u;
     sector = 0u;
     sector_timer_us = 0u;
 

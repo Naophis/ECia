@@ -27,8 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gate_analysis import Channel, analyse  # noqa: E402
-from ocd import ROOT, TIM1_BDTR, TIM_BDTR_MOE  # noqa: E402
+import bridge_check  # noqa: E402
+from gate_analysis import Channel, analyse, check_timebase  # noqa: E402
+from ocd import ROOT, TIM1_ARR, TIM1_BDTR, TIM1_PSC, TIM_BDTR_MOE  # noqa: E402
 from ocd import AdapterError, OpenOCD, bridge_off, emit, require_single_probe  # noqa: E402
 
 
@@ -67,7 +68,9 @@ STATE_FIELDS = (
     "t60_raw_ticks", "t60_filt_ticks", "phase_error_ticks", "rpm_est",
     "startup_count", "startup_failure_count", "moe", "build_id", "mode",
 )
-SAMPLE_INTERVAL_S = 0.02
+# 50 ms, not 20: the trace is for shape, not resolution, and every poll is
+# another USB transaction on a probe that has proven fragile under load.
+SAMPLE_INTERVAL_S = 0.05
 
 
 def symbols(artifact: Path) -> dict[str, int]:
@@ -96,8 +99,39 @@ def read_struct(session: OpenOCD, address: int, fields: tuple[str, ...]) -> dict
     return values
 
 
+BRIDGE_HEADER_WORDS = 4
+BRIDGE_SECTOR_WORDS = 3
+
+
+def read_bridge(session: OpenOCD, address: int) -> tuple[dict[str, object] | None, str | None]:
+    """Read back the six-sector bridge table the firmware probed with MOE off."""
+    magic, abi, count, moe_while_probing = session.read_block(address, BRIDGE_HEADER_WORDS)
+    if magic != HIL_MAGIC:
+        return None, f"hil_bridge magic {magic:#010x} != {HIL_MAGIC:#010x}"
+    if abi != ABI_VERSION:
+        return None, f"hil_bridge abi_version {abi} != {ABI_VERSION}"
+    if moe_while_probing:
+        # The probe walks every sector; if MOE was ever set during it, the
+        # bridge was live while the table was being written.
+        return None, "hil_bridge was probed with the outputs enabled"
+    if count != len(bridge_check.SPEC_SECTORS):
+        return None, f"hil_bridge reports {count} sectors"
+
+    words = session.read_block(address + BRIDGE_HEADER_WORDS * 4, count * BRIDGE_SECTOR_WORDS)
+    sectors = [
+        {"ccer": words[i * 3], "ccmr1": words[i * 3 + 1], "ccmr2": words[i * 3 + 2]}
+        for i in range(count)
+    ]
+    report = bridge_check.check(sectors)
+    report["moe_while_probing"] = moe_while_probing
+    return report, None
+
+
+CAPTURE_SYMBOLS = ("hil_capture", "hil_capture_b", "hil_capture_f")
+
+
 def read_capture(
-    session: OpenOCD, address: int, trial_id: str
+    session: OpenOCD, address: int, trial_id: str, name: str
 ) -> tuple[dict[str, object] | None, str | None]:
     """Pull the on-chip gate capture and reduce it to Milestone 1 measurements.
 
@@ -126,7 +160,7 @@ def read_capture(
 
     directory = ROOT / ".hil" / "logs" / trial_id
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "gate-capture.bin").write_bytes(raw)
+    (directory / f"{name}.bin").write_bytes(raw)
 
     sample_period_ns = ticks / sysclk_hz * 1e9
     report = analyse(values, port["channels"], sample_period_ns, port["phases"])
@@ -135,9 +169,33 @@ def read_capture(
         "sysclk_hz": sysclk_hz,
         "ticks_per_sample": ticks,
         "seq": seq,
-        "raw_file": str((directory / "gate-capture.bin").relative_to(ROOT)),
+        "raw_file": str((directory / f"{name}.bin").relative_to(ROOT)),
     })
     return report, None
+
+
+def gates_high_pct(name: str, report: dict[str, object], trial_id: str) -> dict[str, float]:
+    """How much of the window each gate in this port spent high.
+
+    A gate that must stay off should read exactly 0.0 -- that is the Hi-Z
+    evidence for the phases the bridge is not driving, and it is the one
+    number that says so over the whole window rather than on average.
+    """
+    import array
+
+    path = ROOT / ".hil" / "logs" / trial_id / f"{name}.bin"
+    try:
+        values = array.array("H")
+        values.frombytes(path.read_bytes())
+    except (OSError, ValueError):
+        return {}
+    port = CAPTURE_PORTS.get(int(str(report["port_base"]), 16), {})
+    total = len(values) or 1
+    return {
+        channel.name: round(
+            100.0 * sum(1 for v in values if v & (1 << channel.bit)) / total, 3)
+        for channel in port.get("channels", [])
+    }
 
 
 def finish(payload: dict[str, object], evidence: dict[str, object], trial_id: str) -> int:
@@ -262,10 +320,40 @@ def main(argv: list[str]) -> int:
 
         # Read the capture before resetting: `reset halt` leaves SRAM intact
         # only because startup never runs, which is a thin guarantee to lean on.
-        capture = None
-        if "hil_capture" in table:
-            capture, capture_error = read_capture(session, table["hil_capture"], trial_id)
-            evidence["capture"] = capture if capture else {"unavailable": capture_error}
+        # Each port is a separate DMA stream and therefore a separate block.
+        # They are sampled off one TIM7 update, so the three are comparable.
+        captures: dict[str, dict[str, object]] = {}
+        unavailable: dict[str, str] = {}
+        for name in CAPTURE_SYMBOLS:
+            if name not in table:
+                continue
+            report, why = read_capture(session, table[name], trial_id, name)
+            if report:
+                captures[name] = report
+            elif why:
+                unavailable[name] = why
+        evidence["captures"] = captures
+        if unavailable:
+            evidence["captures_unavailable"] = unavailable
+
+        bridge = None
+        if "hil_bridge" in table:
+            bridge, bridge_error = read_bridge(session, table["hil_bridge"])
+            evidence["bridge_table"] = bridge if bridge else {"unavailable": bridge_error}
+
+        # TIM1's period registers are the ground truth the capture timebase is
+        # checked against. Read them while the bridge is still configured.
+        sysclk = next((int(c["sysclk_hz"]) for c in captures.values()), 0)
+        reference_period_ns = 0.0
+        if sysclk:
+            arr = session.read(TIM1_ARR) & 0xFFFF
+            psc = session.read(TIM1_PSC) & 0xFFFF
+            reference_period_ns = (arr + 1) * (psc + 1) / sysclk * 1e9
+            evidence["tim1_period"] = {"arr": arr, "psc": psc,
+                                       "period_ns": round(reference_period_ns, 1)}
+        timebase = {name: check_timebase(c, reference_period_ns)
+                    for name, c in captures.items()}
+        evidence["timebase"] = timebase
 
         off = bridge_off(session)
         evidence["bridge_after"] = off
@@ -295,28 +383,61 @@ def main(argv: list[str]) -> int:
             "build_id": f"{last['build_id']:08x}",
             "mode": last["mode"],
         }
-        if capture:
-            # A capture that shows both gates of a phase high at once means the
-            # dead-time configuration is wrong. That is a fault, not a result.
-            if not capture["shoot_through_free"]:
-                return finish(
-                    {"status": "fault", "signature": "gate-overlap-detected",
-                     "overlap_samples": capture["overlap_samples_total"]},
-                    evidence, trial_id)
+        # Both gates of one phase high at once means the dead-time
+        # configuration is wrong. That is a fault, not a result.
+        overlap = sum(int(c["overlap_samples_total"]) for c in captures.values())
+        if overlap:
+            return finish(
+                {"status": "fault", "signature": "gate-overlap-detected",
+                 "overlap_samples": overlap},
+                evidence, trial_id)
+        if bridge is not None and not bridge["ok"]:
+            return finish(
+                {"status": "fault", "signature": "bridge-table-mismatch",
+                 "sectors": [e for e in bridge["sectors"] if not e["ok"]],
+                 "both_gates_enabled": bridge["both_gates_enabled"]},
+                evidence, trial_id)
+
+        bad_timebase = [name for name, t in timebase.items()
+                        if t.get("checked") and not t.get("ok")]
+        if bad_timebase:
+            # Refusing here is the whole point: a capture whose timebase is
+            # wrong still produces clean-looking numbers.
+            return finish(
+                {"status": "fault", "signature": "capture-timebase-mismatch",
+                 "ports": bad_timebase,
+                 "detail": {name: timebase[name] for name in bad_timebase}},
+                evidence, trial_id)
+
+        if captures:
             summary["capture"] = {
-                "samples": capture["samples"],
-                "window_us": capture["window_us"],
-                "shoot_through_free": True,
-                "phases": {
+                "ports": {
                     name: {
-                        "pwm_hz": round(phase["pwm"]["frequency_hz"], 1),
-                        "duty_percent": round(phase["pwm"]["duty_percent"], 2),
-                        "dead_time_ns": round(phase["dead_time"]["mean_ns"], 1),
-                        "dead_time_edges": phase["dead_time"]["edges"],
+                        "port_base": c["port_base"],
+                        "samples": c["samples"],
+                        "window_us": c["window_us"],
+                        "stable_patterns": len(c["timeline"]),
+                        "gates_high_pct": gates_high_pct(name, c, trial_id),
+                        "phases": {
+                            phase_name: {
+                                "pwm_hz": round(phase["pwm"]["frequency_hz"], 1),
+                                "duty_percent": round(phase["pwm"]["duty_percent"], 2),
+                                "dead_time_ns": round(phase["dead_time"]["mean_ns"], 1),
+                                "dead_time_edges": phase["dead_time"]["edges"],
+                            }
+                            for phase_name, phase in c["phases"].items()
+                        },
                     }
-                    for name, phase in capture["phases"].items()
+                    for name, c in captures.items()
                 },
-                "sectors": len(capture["timeline"]),
+                "shoot_through_free": True,
+                "timebase": {name: t for name, t in timebase.items() if t.get("checked")},
+            }
+        if bridge is not None:
+            summary["bridge_table"] = {
+                "sectors_checked": len(bridge["sectors"]),
+                "all_match_spec_section_8": bridge["ok"],
+                "both_gates_enabled": bridge["both_gates_enabled"],
             }
         return finish(summary, evidence, trial_id)
     except AdapterError as error:

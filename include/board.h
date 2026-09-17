@@ -70,8 +70,18 @@
  * 58.8 ns per sample -- see docs/on-chip-capture.md for why that resolves a
  * ~550 ns dead time. The divider must not be commensurate with PWM_TICKS or
  * the sampling phase stops sliding and the measurement loses its resolution. */
-#define CAPTURE_TICKS_PER_SAMPLE 10u
-#define CAPTURE_SAMPLES          4096u
+/* 30, not 10. Three DMA channels share one TIM7 update, and at 10 ticks
+ * (17 MHz x 3 streams = 51 M transfers/s) DMA1 cannot keep up: the streams
+ * then advance at the DMA's own throughput instead of the timer's, and every
+ * time in the capture comes out 8.4 % short -- silently. 30 ticks restores
+ * the per-transfer rate that one stream ran at correctly, and the host
+ * cross-checks the result against TIM1's ARR on every trial. */
+#define CAPTURE_TICKS_PER_SAMPLE 30u
+/* 2048 per port, three ports: 12.4 KiB of the 22 KiB SRAM. The window
+ * halves to 120 us (3.8 PWM periods), which is ample -- phase A's dead
+ * time was already measured over 14 edges, and what the other two ports
+ * have to show is that their gates never rise at all. */
+#define CAPTURE_SAMPLES          2048u
 #if (PWM_TICKS % CAPTURE_TICKS_PER_SAMPLE) == 0u
 #error "capture rate divides the PWM period exactly; the sampling phase will not slide"
 #endif
@@ -79,8 +89,12 @@
 /* The port whose IDR is sampled. GPIOA carries LSA(7), HSA(8), HSB(9),
  * HSC(10) -- the only port with both gates of one phase, which is what makes
  * phase A the one dead time is measured on. */
-#define CAPTURE_PORT      GPIOA
-#define CAPTURE_PORT_IDR  ((uint32_t)&GPIOA->IDR)
+#define CAPTURE_PORT_IDR   ((uint32_t)&GPIOA->IDR)
+/* The remaining two gates live in other ports: PB0 = LSB, PF0 = LSC. DMAMUX
+ * lets several channels share one request, so all three ports are sampled in
+ * lockstep off the same TIM7 update. */
+#define CAPTURE_PORT_B_IDR ((uint32_t)&GPIOB->IDR)
+#define CAPTURE_PORT_F_IDR ((uint32_t)&GPIOF->IDR)
 
 /* -------------------------------------------------------------- bring-up -- */
 /* A window at the very top of main(), before the clock tree or any peripheral

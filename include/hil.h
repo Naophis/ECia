@@ -93,8 +93,30 @@ typedef struct {
     uint16_t data[CAPTURE_SAMPLES];
 } hil_capture_t;
 
+/* The six-step table as TIM1 actually applied it, captured with MOE clear so
+ * not one gate is energised. Reading the registers back is the only way to
+ * check that the source/sink/float definition in spec §8 survived the trip
+ * through OCxM and the CCER enable bits. */
+typedef struct {
+    uint32_t ccer;
+    uint32_t ccmr1;
+    uint32_t ccmr2;
+} hil_bridge_sector_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t abi_version;
+    uint32_t count;
+    uint32_t moe_while_probing; /* must read 0: probing never energises */
+    hil_bridge_sector_t sector[6];
+} hil_bridge_t;
+
+extern volatile hil_bridge_t hil_bridge;
+
 extern volatile hil_cmd_t hil_cmd;
 extern volatile hil_state_t hil_state;
-extern volatile hil_capture_t hil_capture;
+extern volatile hil_capture_t hil_capture;   /* GPIOA: LSA, HSA, HSB, HSC */
+extern volatile hil_capture_t hil_capture_b; /* GPIOB: LSB              */
+extern volatile hil_capture_t hil_capture_f; /* GPIOF: LSC              */
 
 void hil_init(void);

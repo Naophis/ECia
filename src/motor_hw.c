@@ -173,6 +173,15 @@ void motor_hw_set_complementary_a(void)
     TIM1->EGR = TIM_EGR_COMG;
 }
 
+void motor_hw_read_bridge(uint32_t *ccer, uint32_t *ccmr1, uint32_t *ccmr2)
+{
+    /* The active registers, not the preload shadows: CCPC makes CCER and OCxM
+     * take effect on a COM event, and only the applied value is readable. */
+    *ccer = TIM1->CCER;
+    *ccmr1 = TIM1->CCMR1;
+    *ccmr2 = TIM1->CCMR2;
+}
+
 void motor_hw_enable(void)
 {
     TIM1->BDTR |= TIM_BDTR_MOE;

@@ -182,6 +182,40 @@ def pattern_timeline(
     return timeline
 
 
+def check_timebase(
+    report: dict[str, object], reference_period_ns: float, tolerance: float = 0.02
+) -> dict[str, object]:
+    """Compare the capture's assumed sample rate against a known period.
+
+    The capture's times are all derived from `ticks_per_sample / sysclk_hz`,
+    which assumes every timer request produced exactly one sample. When DMA
+    cannot keep up -- several streams sharing one request, say -- requests are
+    silently lost and the streams advance at the DMA's throughput instead. The
+    edges stay perfectly evenly spaced, so nothing in the capture looks wrong;
+    every measured time is simply scaled.
+
+    TIM1's own ARR and PSC say what the PWM period really is, so measuring that
+    period back out of the capture is a direct check on the timebase. Without
+    it this instrument can report a confident, wrong dead time.
+    """
+    measured = 0.0
+    for phase in report.get("phases", {}).values():
+        measured = float(phase["pwm"]["period_ns"])
+        break
+    if not measured or not reference_period_ns:
+        return {"checked": False, "reason": "no periodic reference in this capture"}
+    ratio = measured / reference_period_ns
+    return {
+        "checked": True,
+        "ok": abs(ratio - 1.0) <= tolerance,
+        "measured_period_ns": round(measured, 1),
+        "reference_period_ns": round(reference_period_ns, 1),
+        "ratio": round(ratio, 4),
+        "effective_sample_period_ns": round(
+            float(report["sample_period_ns"]) / ratio, 3),
+    }
+
+
 def analyse(
     samples: Sequence[int],
     channels: Sequence[Channel],

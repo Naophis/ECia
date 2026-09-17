@@ -11,7 +11,22 @@
  * away nor cache their fields. */
 volatile hil_cmd_t hil_cmd;
 volatile hil_state_t hil_state;
+volatile hil_bridge_t hil_bridge;
 volatile hil_capture_t hil_capture;
+volatile hil_capture_t hil_capture_b;
+volatile hil_capture_t hil_capture_f;
+
+static void capture_header(volatile hil_capture_t *capture, uint32_t port_base)
+{
+    capture->port_base = port_base;
+    capture->samples = 0u;
+    capture->capacity = CAPTURE_SAMPLES;
+    capture->sysclk_hz = SYSCLK_HZ;
+    capture->ticks_per_sample = CAPTURE_TICKS_PER_SAMPLE;
+    capture->seq = 0u;
+    capture->abi_version = HIL_ABI_VERSION;
+    capture->magic = HIL_CAPTURE_MAGIC;
+}
 
 void hil_init(void)
 {
@@ -35,12 +50,7 @@ void hil_init(void)
     hil_state.abi_version = HIL_ABI_VERSION;
     hil_state.magic = HIL_MAGIC;
 
-    hil_capture.port_base = CAPTURE_PORT_IDR;
-    hil_capture.samples = 0u;
-    hil_capture.capacity = CAPTURE_SAMPLES;
-    hil_capture.sysclk_hz = SYSCLK_HZ;
-    hil_capture.ticks_per_sample = CAPTURE_TICKS_PER_SAMPLE;
-    hil_capture.seq = 0u;
-    hil_capture.abi_version = HIL_ABI_VERSION;
-    hil_capture.magic = HIL_CAPTURE_MAGIC;
+    capture_header(&hil_capture, CAPTURE_PORT_IDR);
+    capture_header(&hil_capture_b, CAPTURE_PORT_B_IDR);
+    capture_header(&hil_capture_f, CAPTURE_PORT_F_IDR);
 }

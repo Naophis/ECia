@@ -98,8 +98,8 @@ class CaptureReadbackTests(unittest.TestCase):
         run_trial.ROOT = self.original_root
         self.tmp.cleanup()
 
-    def read(self, blob, trial_id="t1"):
-        return run_trial.read_capture(StubSession(blob), CAPTURE_BASE, trial_id)
+    def read(self, blob, trial_id="t1", name="hil_capture"):
+        return run_trial.read_capture(StubSession(blob), CAPTURE_BASE, trial_id, name)
 
     def test_valid_capture_is_measured_and_saved(self):
         values = synth()
@@ -115,7 +115,7 @@ class CaptureReadbackTests(unittest.TestCase):
         self.assertAlmostEqual(phase["pwm"]["duty_percent"], 30.0, delta=0.5)
         self.assertAlmostEqual(phase["dead_time"]["mean_ns"], 93 / SYSCLK_HZ * 1e9, delta=20.0)
 
-        saved = self.root / ".hil" / "logs" / "t1" / "gate-capture.bin"
+        saved = self.root / ".hil" / "logs" / "t1" / "hil_capture.bin"
         self.assertTrue(saved.exists())
         self.assertEqual(len(saved.read_bytes()), len(values) * 2)
 
@@ -163,7 +163,8 @@ class CaptureReadbackTests(unittest.TestCase):
         # GPIOF carries only LSC, so there is no phase to measure dead time on,
         # but the sector timeline must still come back.
         values = [1, 1, 1, 0, 0, 0, 1, 1, 1]
-        report, error = self.read(build_blob(values, port_base=0x48001410))
+        report, error = self.read(build_blob(values, port_base=0x48001410),
+                                  name="hil_capture_f")
 
         self.assertIsNone(error)
         self.assertEqual(report["phases"], {})
